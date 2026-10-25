@@ -3,7 +3,7 @@ import type {
   PrintPaper,
   PrintRotationOverride,
 } from './project-document.ts';
-import type { Piece, PrintGroup, Wall } from './studio.ts';
+import type { LayoutName, Piece, PrintGroup, Wall } from './studio.ts';
 import { cloneTextData } from './text-elements.ts';
 
 /**
@@ -15,6 +15,8 @@ import { cloneTextData } from './text-elements.ts';
  * scope.
  */
 export type EditorSnapshot = {
+  /** Optional for snapshots created before composition history was added. */
+  layout?: LayoutName | 'custom';
   pieces: Piece[];
   printGroups: PrintGroup[];
   wall: Wall;
@@ -57,6 +59,7 @@ function clonePrintRotationOverrides(
 /** Make a mutation-safe copy while dropping any accidental transient fields. */
 export function cloneEditorSnapshot(snapshot: EditorSnapshot): EditorSnapshot {
   return {
+    ...(snapshot.layout ? { layout: snapshot.layout } : {}),
     pieces: clonePieces(snapshot.pieces),
     printGroups: snapshot.printGroups.map((group) => ({ ...group, memberIds: [...group.memberIds] })),
     wall: { ...snapshot.wall },

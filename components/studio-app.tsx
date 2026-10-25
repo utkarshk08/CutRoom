@@ -97,6 +97,8 @@ import {
   type ProjectDocument,
   type ProjectValidationResult,
 } from '@/lib/project-document';
+import { portableProjectJson } from '@/lib/project-backup';
+import { isPrintAnnotationClear, printCropMarkSegments, PRINT_MARK_WIDTH_CM } from '@/lib/print-annotations';
 import {
   borderEdgesForPreset,
   borderPresetForEdges,
@@ -862,6 +864,7 @@ export function StudioApp() {
   const [aiCutBrief, setAiCutBrief] = React.useState('Find every separate photo or panel. Keep each region tight so neighbouring images never bleed into one another.');
   const [aiCutShapePreference, setAiCutShapePreference] = React.useState<AiCutoutShapePreference>('auto');
   const [aiCutBusy, setAiCutBusy] = React.useState(false);
+  const [cutCreating, setCutCreating] = React.useState(false);
   const [aiCutError, setAiCutError] = React.useState('');
   const [aiCutMeta, setAiCutMeta] = React.useState<CutoutMeta>({});
   const [sheetPaper, setSheetPaper] = React.useState<keyof typeof PAPER_SIZES>('A3');
@@ -903,7 +906,10 @@ export function StudioApp() {
   const suppressWallClickRef = React.useRef(false);
   const sizeEditRef = React.useRef<{ before: Piece[]; changed: boolean } | null>(null);
   const historyTransactionRef = React.useRef<{ before: EditorSnapshot; changed: boolean } | null>(null);
+  const editorRevisionRef = React.useRef(0);
   const cutRegionCounterRef = React.useRef(0);
+  const aiCutRequestRef = React.useRef<AbortController | null>(null);
+  const cutCreatingRef = React.useRef(false);
   const noticeTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
   const identityRef = React.useRef(identityRegistry);
   const latestPiecesRef = React.useRef(pieces);
@@ -1276,6 +1282,7 @@ export function StudioApp() {
   }, [saveState]);
 
   const captureEditorSnapshot = React.useCallback((overrides: Partial<EditorSnapshot> = {}) => cloneEditorSnapshot({
+    layout,
     pieces,
     printGroups,
     wall,
@@ -1291,7 +1298,11 @@ export function StudioApp() {
     printMargin,
     cropMarks,
     ...overrides,
-  }), [autoRotatePrint, cropMarks, customSheetH, customSheetW, pieces, printGap, printGroups, printLandscape, printMargin, printOverrides, printPaper, printRotationOverrides, showWallLabels, wall]);
+  }), [autoRotatePrint, cropMarks, customSheetH, customSheetW, layout, pieces, printGap, printGroups, printLandscape, printMargin, printOverrides, printPaper, printRotationOverrides, showWallLabels, wall]);
+
+  React.useLayoutEffect(() => {
+    editorRevisionRef.current += 1;
+  }, [captureEditorSnapshot]);
 
   const commitSnapshot = React.useCallback((before: EditorSnapshot) => {
     setHistory((items) => pushHistorySnapshot(items, before));
@@ -1326,6 +1337,7 @@ export function StudioApp() {
     // During local hot reload, an older in-memory entry can predate new snapshot
     // fields. Current values are safe fallbacks until that old history is gone.
     const restored = cloneEditorSnapshot({ ...captureEditorSnapshot(), ...snapshot });
+    setLayout(restored.layout ?? 'custom');
     setPieces(restored.pieces);
     setPrintGroups(restored.printGroups);
     setWall(restored.wall);
@@ -2123,13 +2135,27 @@ export function StudioApp() {
   const applyTemplate = (nextLayout: LayoutName) => {
     if (cropSession) {
       toast('Finish or cancel the crop before changing the composition.');
-      return;
+      return false;
     }
-    commit(pieces);
-    setLayout(nextLayout);
-    setPieces(applyLayout(pieces, nextLayout, wall, density, groupStrength, printGroups));
-    setCandidateOpen(false);
-    toast(`${layouts.find((item) => item.id === nextLayout)?.name} rearranged positions. Every photo size stayed unchanged.`);
+    try {
+      const nextPieces = applyLayout(pieces, nextLayout, wall, density, groupStrength, printGroups);
+      const changed = nextPieces.some((piece, index) => piece.x !== pieces[index]?.x || piece.y !== pieces[index]?.y);
+      if (!changed) {
+        toast('No positions changed. Place unlocked photos on the wall, or try another composition.');
+        return false;
+      }
+      commit(pieces);
+      setLayout(nextLayout);
+      setPieces(nextPieces);
+      setCandidateOpen(false);
+      toast(`${layouts.find((item) => item.id === nextLayout)?.name} rearranged positions. Every photo size stayed unchanged.`);
+      return true;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'This arrangement could not be completed safely.';
+      setAiResponse(`Nothing moved. ${message}`);
+      toast(`Nothing moved. ${message}`);
+      return false;
+    }
   };
 
   const addSingleAsset = (asset: PendingAsset) => {
@@ -2216,7 +2242,33 @@ export function StudioApp() {
     }
   };
 
+  const cancelAiCutout = React.useCallback(() => {
+    aiCutRequestRef.current?.abort();
+    aiCutRequestRef.current = null;
+    setAiCutBusy(false);
+  }, []);
+
+  React.useEffect(() => () => {
+    aiCutRequestRef.current?.abort();
+    aiCutRequestRef.current = null;
+  }, []);
+
+  const changeCutterOpen = (open: boolean) => {
+    if (cutCreatingRef.current) return;
+    if (!open) cancelAiCutout();
+    setCutOpen(open);
+  };
+
+  const changeCutMode = (mode: 'grid' | 'ai' | 'manual') => {
+    cancelAiCutout();
+    setAiCutError('');
+    setCutMode(mode);
+    setCutPreviewMode(mode === 'ai' && cutRegions.length ? 'result' : 'edit');
+    setSelectedCutId(mode === 'grid' ? null : cutRegions[0]?.id ?? null);
+  };
+
   const openCutter = () => {
+    cancelAiCutout();
     setImportOpen(false);
     setCutRegions([]);
     setSelectedCutId(null);
@@ -2297,22 +2349,37 @@ export function StudioApp() {
   };
 
   const runAiCutout = async () => {
-    if (!pendingAsset || aiCutBusy) return;
+    if (!pendingAsset || aiCutRequestRef.current || cutCreatingRef.current) return;
     const brief = aiCutBrief.trim();
     if (!brief) {
       toast('Tell AI what separate photos or subjects it should find.');
       return;
     }
+    const controller = new AbortController();
+    aiCutRequestRef.current = controller;
+    const isCurrent = () => aiCutRequestRef.current === controller && !controller.signal.aborted;
+    // Bound the entire client operation, including response decoding. A late
+    // response must never overwrite another sheet, mode, or newer request.
+    const timeout = setTimeout(() => {
+      if (!isCurrent()) return;
+      controller.abort();
+      aiCutRequestRef.current = null;
+      setAiCutBusy(false);
+      setAiCutError('Detection took too long. Retry, or use Grid or Manual. Your existing cuts are unchanged.');
+    }, 120_000);
     setAiCutBusy(true);
     setAiCutError('');
     try {
       const imageDataUrl = await createAiCutoutPreview(pendingAsset);
+      if (!isCurrent()) return;
       const response = await fetch('/api/ai-cutouts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ imageDataUrl, brief, shapePreference: aiCutShapePreference }),
+        signal: controller.signal,
       });
       const body = await response.json().catch(() => null) as unknown;
+      if (!isCurrent()) return;
       if (!response.ok) {
         const message = body && typeof body === 'object' && 'message' in body && typeof body.message === 'string'
           ? body.message
@@ -2333,16 +2400,21 @@ export function StudioApp() {
       setCutPreviewMode('result');
       toast(`AI found ${proposals.length} editable ${proposals.length === 1 ? 'region' : 'regions'}. Review every edge before creating cutouts.`);
     } catch (error) {
+      if (!isCurrent()) return;
       const message = error instanceof Error ? error.message : 'AI could not suggest cuts for this sheet.';
       setAiCutError(message);
       toast(message);
     } finally {
-      setAiCutBusy(false);
+      clearTimeout(timeout);
+      if (aiCutRequestRef.current === controller) {
+        aiCutRequestRef.current = null;
+        setAiCutBusy(false);
+      }
     }
   };
 
   const createCutouts = async () => {
-    if (!pendingAsset) return;
+    if (!pendingAsset || cutCreatingRef.current || aiCutRequestRef.current) return;
     const regions = cutMode === 'grid' ? gridRegions : cutRegions;
     if (!regions.length) {
       toast('Add or detect at least one cut region first.');
@@ -2352,6 +2424,8 @@ export function StudioApp() {
       toast(`This cut would exceed the ${MAX_PROJECT_PIECES.toLocaleString()}-photo project limit. Use fewer crop boxes or remove some pieces first.`);
       return;
     }
+    cutCreatingRef.current = true;
+    setCutCreating(true);
     try {
       setBusy(`Creating ${regions.length} cutouts…`);
       const cutouts = await cropAsset(pendingAsset, regions);
@@ -2389,11 +2463,14 @@ export function StudioApp() {
     } catch (error) {
       toast(error instanceof Error ? error.message : 'The sheet could not be cut.');
     } finally {
+      cutCreatingRef.current = false;
+      setCutCreating(false);
       setBusy('');
     }
   };
 
   const runAssistant = async () => {
+    if (aiBusy) return;
     if (cropSession) {
       toast('Finish or cancel the crop before arranging the wall.');
       return;
@@ -2439,6 +2516,7 @@ export function StudioApp() {
         };
       }),
     };
+    const startingEditorRevision = editorRevisionRef.current;
     setAiBusy(true);
     try {
       let decision;
@@ -2463,7 +2541,7 @@ export function StudioApp() {
       const controlsChanged = latestAiControlsRef.current.prompt !== prompt
         || latestAiControlsRef.current.density !== density
         || latestAiControlsRef.current.groupStrength !== groupStrength;
-      if (latestPiecesRef.current !== pieces || latestPrintGroupsRef.current !== printGroups || latestWallRef.current !== wall || controlsChanged) {
+      if (editorRevisionRef.current !== startingEditorRevision || latestPiecesRef.current !== pieces || latestPrintGroupsRef.current !== printGroups || latestWallRef.current !== wall || controlsChanged) {
         setAiResponse('Your wall or brief changed while the suggestion was being prepared, so I left the newer edit untouched. Run the brief again when you are ready.');
         toast('AI suggestion paused because the wall or brief changed. Your newer edit was kept.');
         return;
@@ -2566,31 +2644,45 @@ export function StudioApp() {
     toast(`${targetIds.size} ${targetIds.size === 1 ? 'photo' : 'photos'} deleted from the project${removeLockedCount ? ` · ${removeLockedCount} locked skipped` : ''}. One Undo restores everything.`);
   };
 
-  const shareProject = async () => {
+  const shareApp = async () => {
     try {
-      if (navigator.share) await navigator.share({ title: 'My Cutroom poster wall', text: 'See the poster wall I designed in Cutroom.', url: location.href });
+      const url = `${location.origin}/`;
+      if (navigator.share) await navigator.share({ title: 'Cutroom Wall Studio', text: 'Design your own poster wall with Cutroom. This link does not include my project.', url });
       else {
-        await navigator.clipboard.writeText(location.href);
-        toast('Project link copied.');
+        await navigator.clipboard.writeText(url);
+        toast('App link copied. Your project is not included; use a backup to transfer it.');
       }
     } catch {
       toast('Share cancelled.');
     }
   };
 
-  const downloadProjectDocument = (project: ProjectDocument, fileName = 'cutroom-project.json') => {
-    const data = JSON.stringify(project);
-    const bytes = new Blob([data]).size;
-    if (bytes > MAX_BACKUP_BYTES) {
-      toast(`This project is larger than the ${Math.round(MAX_BACKUP_BYTES / 1024 / 1024)} MB safe restore limit. Remove or replace some large source images before downloading a portable backup.`);
+  const downloadProjectDocument = async (project: ProjectDocument, fileName = 'cutroom-project.json') => {
+    if (busy) return false;
+    setBusy('Preparing a portable backup…');
+    try {
+      const data = await portableProjectJson(project, async (source) => {
+        const response = await fetch(source, { signal: AbortSignal.timeout(30_000) });
+        if (!response.ok) throw new Error('A source image is unavailable. Backup was not downloaded; your open project is unchanged.');
+        const blob = await response.blob();
+        if (!/^image\/(png|jpeg|webp)$/i.test(blob.type) || blob.size > MAX_BACKUP_BYTES) throw new Error('A backup source image is invalid or too large.');
+        return new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result));
+          reader.onerror = () => reject(new Error('A backup image could not be read.'));
+          reader.readAsDataURL(blob);
+        });
+      });
+      downloadBlob(data, 'application/json', fileName);
+      return true;
+    } catch (error) {
+      toast(error instanceof Error ? error.message : 'Backup could not be prepared. Your open project is unchanged.');
       return false;
-    }
-    downloadBlob(data, 'application/json', fileName);
-    return true;
+    } finally { setBusy(''); }
   };
 
-  const exportProject = () => {
-    if (downloadProjectDocument(buildProjectDocument())) toast('Portable project file downloaded.');
+  const exportProject = async () => {
+    if (await downloadProjectDocument(buildProjectDocument())) toast('Portable project file downloaded, including all images.');
   };
 
   const openBackupPicker = () => {
@@ -3141,20 +3233,12 @@ export function StudioApp() {
             page.pushOperators(popGraphicsState());
           }
           page.pushOperators(popGraphicsState());
-          if (snapshotCropMarks) {
-            const offset = mm(0.04);
-            const mark = mm(0.22);
-            const color = rgb(0.15, 0.15, 0.14);
-            page.drawLine({ start: { x: x - offset - mark, y }, end: { x: x - offset, y }, thickness: 0.4, color });
-            page.drawLine({ start: { x, y: y - offset - mark }, end: { x, y: y - offset }, thickness: 0.4, color });
-            page.drawLine({ start: { x: x + footprintW + offset, y }, end: { x: x + footprintW + offset + mark, y }, thickness: 0.4, color });
-            page.drawLine({ start: { x: x + footprintW, y: y - offset - mark }, end: { x: x + footprintW, y: y - offset }, thickness: 0.4, color });
-            page.drawLine({ start: { x: x - offset - mark, y: y + footprintH }, end: { x: x - offset, y: y + footprintH }, thickness: 0.4, color });
-            page.drawLine({ start: { x, y: y + footprintH + offset }, end: { x, y: y + footprintH + offset + mark }, thickness: 0.4, color });
-            page.drawLine({ start: { x: x + footprintW + offset, y: y + footprintH }, end: { x: x + footprintW + offset + mark, y: y + footprintH }, thickness: 0.4, color });
-            page.drawLine({ start: { x: x + footprintW, y: y + footprintH + offset }, end: { x: x + footprintW, y: y + footprintH + offset + mark }, thickness: 0.4, color });
-          }
-          if (snapshotGap >= 0.3 && y >= 6) page.drawText(content.code, { x: x + 0.5, y: y - 5.1, size: 4.2, font, color: rgb(0.35, 0.35, 0.34) });
+          const labelWidth = font.widthOfTextAtSize(content.code, 4.2);
+          const labelRect = { x: placement.xCm + 0.5 / mm(1), y: placement.yCm + footprint.heightCm + 0.9 / mm(1), w: labelWidth / mm(1), h: 5.3 / mm(1) };
+          if (snapshotGap >= 0.3 && isPrintAnnotationClear(labelRect, packedPage.placements, snapshotSheetW, snapshotSheetH)) page.drawText(content.code, { x: x + 0.5, y: y - 5.1, size: 4.2, font, color: rgb(0.35, 0.35, 0.34) });
+        }
+        if (snapshotCropMarks) for (const mark of printCropMarkSegments(packedPage.placements, snapshotSheetW, snapshotSheetH)) {
+          page.drawLine({ start: { x: mm(mark.x1), y: mm(snapshotSheetH - mark.y1) }, end: { x: mm(mark.x2), y: mm(snapshotSheetH - mark.y2) }, thickness: 0.4, color: rgb(0.15, 0.15, 0.14) });
         }
       }
       const bytes = await pdf.save();
@@ -3429,7 +3513,7 @@ export function StudioApp() {
         </nav>
         <div className="top-actions">
           <span className={`saved-indicator ${saveState}`}><i /> {saveState === 'loading' ? 'Restoring…' : saveState === 'saving' ? 'Saving…' : saveState === 'dirty' ? 'Unsaved changes' : saveState === 'error' ? 'Local save paused' : 'Saved locally'}</span>
-          <Button variant="outline" className="square-button" onClick={shareProject}><MessageCircleMore /> Share</Button>
+          <Button variant="outline" className="square-button" title="Share the app link, not your project" onClick={shareApp}><MessageCircleMore /> Share app</Button>
           <Button className="export-button" disabled={Boolean(cropSession)} onClick={() => setExportOpen(true)}><Download /> Export</Button>
           <button className="avatar" aria-label="Profile" onClick={() => toast('This local-first prototype does not need an account.')}>UK</button>
         </div>
@@ -3440,7 +3524,7 @@ export function StudioApp() {
         <div><b>{storageNotice.error.kind === 'corrupt' ? 'Saved project needs recovery' : storageNotice.error.kind === 'quota' ? 'Local storage is full' : 'Local saving is paused'}</b><p>{storageNotice.error.message} {storageNotice.error.kind !== 'corrupt' && 'Download an emergency backup before closing or reloading this tab.'}</p></div>
         <div className="storage-recovery-actions">
           {storageNotice.rawRecovery && <button onClick={downloadRawRecovery}><FileArchive /> Raw recovery</button>}
-          <button onClick={() => { if (downloadProjectDocument(buildProjectDocument(), 'cutroom-emergency-backup.json')) toast('Emergency project backup downloaded.'); }}><Download /> Emergency backup</button>
+          <button onClick={async () => { if (await downloadProjectDocument(buildProjectDocument(), 'cutroom-emergency-backup.json')) toast('Emergency project backup downloaded.'); }}><Download /> Emergency backup</button>
           <button onClick={openBackupPicker}><Upload /> Restore backup</button>
           {storageNotice.error.kind === 'corrupt' ? <button className="danger" onClick={() => setFreshStartOpen(true)}><Trash2 /> Start fresh…</button> : <button className="primary" onClick={() => { void retryLocalSave(); }}><RotateCw /> Retry save</button>}
         </div>
@@ -3460,7 +3544,7 @@ export function StudioApp() {
             <button className="upload-zone" onClick={() => uploadRef.current?.click()} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { event.preventDefault(); void importFiles(Array.from(event.dataTransfer.files)); }}>
               <span>{busy.startsWith('Reading') ? <RotateCcw className="spin" /> : <Upload />}</span><b>Drop photos or sheets</b><small>JPG, PNG or WebP · processed on-device</small>
             </button>
-            <div className="size-row"><label>Default photo size</label><NativeSelect value={posterPreset} onChange={(event) => setPosterPreset(event.target.value as PhotoSizePreset)}><NativeSelectOption value="Original">Original proportions</NativeSelectOption><NativeSelectOption value="A6">A6</NativeSelectOption><NativeSelectOption value="A5">A5</NativeSelectOption><NativeSelectOption value="A4">A4</NativeSelectOption><NativeSelectOption value="A3">A3</NativeSelectOption><NativeSelectOption value="A2">A2</NativeSelectOption><NativeSelectOption value="A1">A1</NativeSelectOption></NativeSelect></div>
+            <div className="size-row"><label>Default photo size</label><NativeSelect aria-label="Default photo size" value={posterPreset} onChange={(event) => setPosterPreset(event.target.value as PhotoSizePreset)}><NativeSelectOption value="Original">Original proportions</NativeSelectOption><NativeSelectOption value="A6">A6</NativeSelectOption><NativeSelectOption value="A5">A5</NativeSelectOption><NativeSelectOption value="A4">A4</NativeSelectOption><NativeSelectOption value="A3">A3</NativeSelectOption><NativeSelectOption value="A2">A2</NativeSelectOption><NativeSelectOption value="A1">A1</NativeSelectOption></NativeSelect></div>
             <div className="tray-tools">
               <button className={filter === 'all' ? 'active' : ''} onClick={() => setFilter('all')}>All <b>{pieces.length}</b></button>
               <button className={filter === 'placed' ? 'active' : ''} onClick={() => setFilter('placed')}>Placed <b>{placedCount}</b></button>
@@ -3645,21 +3729,21 @@ export function StudioApp() {
                     <label>TYPOGRAPHY</label>
                     <div className="text-font-row"><NativeSelect value={selected.text.style.fontId} aria-label="Text font family" onChange={(event) => updateSelectedTextStyle({ fontId: event.target.value as TextFontId })}><NativeSelectOption value="sans">Modern sans</NativeSelectOption><NativeSelectOption value="serif">Editorial serif</NativeSelectOption><NativeSelectOption value="mono">Monospace</NativeSelectOption><NativeSelectOption value="condensed">Condensed display</NativeSelectOption><NativeSelectOption value="hand">Handwritten</NativeSelectOption></NativeSelect><label><span>Size</span><Input type="number" min={4} max={300} step={1} value={selected.text.style.fontSizePt} aria-label="Font size in points" onFocus={(event) => { event.currentTarget.select(); beginHistoryTransaction(); }} onBlur={endHistoryTransaction} onChange={(event) => { const fontSizePt = clamp(Number(event.target.value), 4, 300); beginHistoryTransaction(); markHistoryTransactionChanged(); updateSelectedTextStyle({ fontSizePt }, false); }} /></label></div>
                     <div className="text-format-buttons" aria-label="Text formatting"><button type="button" className={selected.text.style.fontWeight >= 700 ? 'active' : ''} aria-label="Bold" aria-pressed={selected.text.style.fontWeight >= 700} onClick={() => updateSelectedTextStyle({ fontWeight: selected.text!.style.fontWeight >= 700 ? 500 : 800 })}><Bold /></button><button type="button" className={selected.text.style.italic ? 'active' : ''} aria-label="Italic" aria-pressed={selected.text.style.italic} onClick={() => updateSelectedTextStyle({ italic: !selected.text!.style.italic })}><Italic /></button><button type="button" className={selected.text.style.underline ? 'active' : ''} aria-label="Underline" aria-pressed={selected.text.style.underline} onClick={() => updateSelectedTextStyle({ underline: !selected.text!.style.underline })}><Underline /></button><button type="button" className={selected.text.style.uppercase ? 'active' : ''} aria-label="Uppercase" aria-pressed={selected.text.style.uppercase} onClick={() => updateSelectedTextStyle({ uppercase: !selected.text!.style.uppercase })}>AA</button><i /><button type="button" className={selected.text.style.align === 'left' ? 'active' : ''} aria-label="Align left" onClick={() => updateSelectedTextStyle({ align: 'left' })}><AlignLeft /></button><button type="button" className={selected.text.style.align === 'center' ? 'active' : ''} aria-label="Align center" onClick={() => updateSelectedTextStyle({ align: 'center' })}><AlignCenter /></button><button type="button" className={selected.text.style.align === 'right' ? 'active' : ''} aria-label="Align right" onClick={() => updateSelectedTextStyle({ align: 'right' })}><AlignRight /></button></div>
-                    <div className="text-color-row"><label>Text color <input type="color" value={selected.text.style.color} aria-label="Text color" onChange={(event) => updateSelectedTextStyle({ color: event.target.value })} /></label><label className="text-gradient-toggle"><Switch size="sm" checked={Boolean(selected.text.style.gradientFrom && selected.text.style.gradientTo)} onCheckedChange={(checked) => updateSelectedTextStyle(checked ? { gradientFrom: selected.text!.style.color, gradientTo: '#ff6b9a' } : { gradientFrom: undefined, gradientTo: undefined })} /> Gradient</label>{selected.text.style.gradientFrom && selected.text.style.gradientTo && <><input type="color" value={selected.text.style.gradientFrom} aria-label="Gradient start color" onChange={(event) => updateSelectedTextStyle({ gradientFrom: event.target.value })} /><input type="color" value={selected.text.style.gradientTo} aria-label="Gradient end color" onChange={(event) => updateSelectedTextStyle({ gradientTo: event.target.value })} /></>}</div>
-                    <label className="text-slider-label">LETTER SPACING <b>{selected.text.style.letterSpacingEm.toFixed(2)} em</b><Slider value={[selected.text.style.letterSpacingEm]} min={-.15} max={.8} step={.01} onValueChange={(value) => { beginHistoryTransaction(); markHistoryTransactionChanged(); updateSelectedTextStyle({ letterSpacingEm: sliderValue(value) }, false); }} onValueCommitted={endHistoryTransaction} /></label>
-                    <label className="text-slider-label">LINE HEIGHT <b>{selected.text.style.lineHeight.toFixed(2)}</b><Slider value={[selected.text.style.lineHeight]} min={.7} max={2.4} step={.05} onValueChange={(value) => { beginHistoryTransaction(); markHistoryTransactionChanged(); updateSelectedTextStyle({ lineHeight: sliderValue(value) }, false); }} onValueCommitted={endHistoryTransaction} /></label>
-                    <label className="text-slider-label">OPACITY <b>{Math.round(selected.text.style.opacity * 100)}%</b><Slider value={[selected.text.style.opacity]} min={.05} max={1} step={.01} onValueChange={(value) => { beginHistoryTransaction(); markHistoryTransactionChanged(); updateSelectedTextStyle({ opacity: sliderValue(value) }, false); }} onValueCommitted={endHistoryTransaction} /></label>
+                    <div className="text-color-row"><label>Text color <input type="color" value={selected.text.style.color} aria-label="Text color" onChange={(event) => updateSelectedTextStyle({ color: event.target.value })} /></label><label className="text-gradient-toggle"><Switch size="sm" aria-label="Text gradient" checked={Boolean(selected.text.style.gradientFrom && selected.text.style.gradientTo)} onCheckedChange={(checked) => updateSelectedTextStyle(checked ? { gradientFrom: selected.text!.style.color, gradientTo: '#ff6b9a' } : { gradientFrom: undefined, gradientTo: undefined })} /> Gradient</label>{selected.text.style.gradientFrom && selected.text.style.gradientTo && <><input type="color" value={selected.text.style.gradientFrom} aria-label="Gradient start color" onChange={(event) => updateSelectedTextStyle({ gradientFrom: event.target.value })} /><input type="color" value={selected.text.style.gradientTo} aria-label="Gradient end color" onChange={(event) => updateSelectedTextStyle({ gradientTo: event.target.value })} /></>}</div>
+                    <label className="text-slider-label">LETTER SPACING <b>{selected.text.style.letterSpacingEm.toFixed(2)} em</b><Slider aria-label="Text letter spacing" aria-valuetext={`${selected.text.style.letterSpacingEm.toFixed(2)} em`} value={[selected.text.style.letterSpacingEm]} min={-.15} max={.8} step={.01} onValueChange={(value) => { beginHistoryTransaction(); markHistoryTransactionChanged(); updateSelectedTextStyle({ letterSpacingEm: sliderValue(value) }, false); }} onValueCommitted={endHistoryTransaction} /></label>
+                    <label className="text-slider-label">LINE HEIGHT <b>{selected.text.style.lineHeight.toFixed(2)}</b><Slider aria-label="Text line height" value={[selected.text.style.lineHeight]} min={.7} max={2.4} step={.05} onValueChange={(value) => { beginHistoryTransaction(); markHistoryTransactionChanged(); updateSelectedTextStyle({ lineHeight: sliderValue(value) }, false); }} onValueCommitted={endHistoryTransaction} /></label>
+                    <label className="text-slider-label">OPACITY <b>{Math.round(selected.text.style.opacity * 100)}%</b><Slider aria-label="Text opacity" aria-valuetext={`${Math.round(selected.text.style.opacity * 100)}%`} value={[selected.text.style.opacity]} min={.05} max={1} step={.01} onValueChange={(value) => { beginHistoryTransaction(); markHistoryTransactionChanged(); updateSelectedTextStyle({ opacity: sliderValue(value) }, false); }} onValueCommitted={endHistoryTransaction} /></label>
                   </div>
                   <div className="inspect-section text-effects-section">
                     <label>EFFECTS</label>
                     <div className={`text-effect-row text-background-row ${selected.text.style.backgroundColor && selected.text.style.backgroundOpacity > 0 ? 'enabled' : 'transparent'}`}><span><b>Text box background</b><small>{selected.text.style.backgroundColor && selected.text.style.backgroundOpacity > 0 ? 'A colour sits behind the letters' : 'Transparent · only the letters remain'}</small></span><input type="color" aria-label="Text box background color" value={selected.text.style.backgroundColor ?? '#ffffff'} onChange={(event) => updateSelectedTextStyle({ backgroundColor: event.target.value, backgroundOpacity: selected.text!.style.backgroundOpacity || 1 })} /><Switch size="sm" aria-label="Show text box background" checked={Boolean(selected.text.style.backgroundColor && selected.text.style.backgroundOpacity)} onCheckedChange={(checked) => updateSelectedTextStyle(checked ? { backgroundColor: selected.text!.style.backgroundColor ?? '#ffffff', backgroundOpacity: 1 } : { backgroundColor: undefined, backgroundOpacity: 0 })} />{selected.text.style.backgroundColor && selected.text.style.backgroundOpacity > 0 && <><label className="text-background-opacity">BACKGROUND OPACITY <b>{Math.round(selected.text.style.backgroundOpacity * 100)}%</b><Slider aria-label="Text box background opacity" value={[selected.text.style.backgroundOpacity]} min={.05} max={1} step={.01} onValueChange={(value) => { beginHistoryTransaction(); markHistoryTransactionChanged(); updateSelectedTextStyle({ backgroundOpacity: sliderValue(value) }, false); }} onValueCommitted={endHistoryTransaction} /></label><button type="button" className="text-background-remove" onClick={() => updateSelectedTextStyle({ backgroundColor: undefined, backgroundOpacity: 0 })}><X /> Make background transparent</button></>}</div>
-                    <div className="text-effect-row"><span><b>Outline</b><small>Sticker and title effect</small></span><input type="color" aria-label="Text outline color" value={selected.text.style.strokeColor ?? '#ffffff'} onChange={(event) => updateSelectedTextStyle({ strokeColor: event.target.value, strokeWidthPt: selected.text!.style.strokeWidthPt || 2 })} /><Switch size="sm" checked={Boolean(selected.text.style.strokeColor && selected.text.style.strokeWidthPt)} onCheckedChange={(checked) => updateSelectedTextStyle(checked ? { strokeColor: selected.text!.style.strokeColor ?? '#ffffff', strokeWidthPt: 2 } : { strokeWidthPt: 0 })} /></div>
-                    <div className="text-effect-row"><span><b>Shadow</b><small>Depth without changing the box size</small></span><input type="color" aria-label="Text shadow color" value={selected.text.style.shadowColor ?? '#171923'} onChange={(event) => updateSelectedTextStyle({ shadowColor: event.target.value, shadowBlurPt: selected.text!.style.shadowBlurPt || 3, shadowXPt: selected.text!.style.shadowXPt || 2, shadowYPt: selected.text!.style.shadowYPt || 2 })} /><Switch size="sm" checked={Boolean(selected.text.style.shadowColor && (selected.text.style.shadowBlurPt || selected.text.style.shadowXPt || selected.text.style.shadowYPt))} onCheckedChange={(checked) => updateSelectedTextStyle(checked ? { shadowColor: selected.text!.style.shadowColor ?? '#171923', shadowBlurPt: 3, shadowXPt: 2, shadowYPt: 2 } : { shadowBlurPt: 0, shadowXPt: 0, shadowYPt: 0 })} /></div>
+                    <div className="text-effect-row"><span><b>Outline</b><small>Sticker and title effect</small></span><input type="color" aria-label="Text outline color" value={selected.text.style.strokeColor ?? '#ffffff'} onChange={(event) => updateSelectedTextStyle({ strokeColor: event.target.value, strokeWidthPt: selected.text!.style.strokeWidthPt || 2 })} /><Switch size="sm" aria-label="Text outline" checked={Boolean(selected.text.style.strokeColor && selected.text.style.strokeWidthPt)} onCheckedChange={(checked) => updateSelectedTextStyle(checked ? { strokeColor: selected.text!.style.strokeColor ?? '#ffffff', strokeWidthPt: 2 } : { strokeWidthPt: 0 })} /></div>
+                    <div className="text-effect-row"><span><b>Shadow</b><small>Depth without changing the box size</small></span><input type="color" aria-label="Text shadow color" value={selected.text.style.shadowColor ?? '#171923'} onChange={(event) => updateSelectedTextStyle({ shadowColor: event.target.value, shadowBlurPt: selected.text!.style.shadowBlurPt || 3, shadowXPt: selected.text!.style.shadowXPt || 2, shadowYPt: selected.text!.style.shadowYPt || 2 })} /><Switch size="sm" aria-label="Text shadow" checked={Boolean(selected.text.style.shadowColor && (selected.text.style.shadowBlurPt || selected.text.style.shadowXPt || selected.text.style.shadowYPt))} onCheckedChange={(checked) => updateSelectedTextStyle(checked ? { shadowColor: selected.text!.style.shadowColor ?? '#171923', shadowBlurPt: 3, shadowXPt: 2, shadowYPt: 2 } : { shadowBlurPt: 0, shadowXPt: 0, shadowYPt: 0 })} /></div>
                   </div>
-                  <div className="inspect-section measurement-section"><div className="inspect-heading-row"><label>TEXT BOX SIZE</label><UnitToggle value={measurementUnit} onChange={setProjectUnit} label="Text box size unit" /></div><div className="two-inputs"><span>W ({measurementUnit})<Input type="number" value={formatMeasurement(selected.widthCm, measurementUnit)} min={.5} step={.1} onFocus={(event) => { event.currentTarget.select(); beginSizeEdit(); }} onBlur={endSizeEdit} onChange={(event) => changeSinglePrintSize('width', Number(event.target.value))} /></span><span>H ({measurementUnit})<Input type="number" value={formatMeasurement(selected.heightCm, measurementUnit)} min={.5} step={.1} onFocus={(event) => { event.currentTarget.select(); beginSizeEdit(); }} onBlur={endSizeEdit} onChange={(event) => changeSinglePrintSize('height', Number(event.target.value))} /></span></div></div>
-                  <div className="inspect-section rotation-control"><label>ROTATION <b>{Math.round(selected.rotation)}°</b></label><Slider value={[selected.rotation]} min={-180} max={180} step={1} onValueChange={(value) => { beginHistoryTransaction(); markHistoryTransactionChanged(); updatePiece(selected.id, { rotation: sliderValue(value) }, false); }} onValueCommitted={endHistoryTransaction} /><div className="rotation-scale"><span>−180°</span><span>0°</span><span>180°</span></div></div>
-                  <div className="inspect-section lock-row"><div><label>LOCK POSITION</label><p>Composition never moves text; lock also prevents hand dragging.</p></div><Switch checked={selected.locked} onCheckedChange={(checked) => updatePiece(selected.id, { locked: checked })} /></div>
-                  <div className="inspect-section lock-row"><div><label>INCLUDE IN PRINT PACK</label><p>Print this text box at its exact wall size.</p></div><Switch checked={selected.text.printable} onCheckedChange={(checked) => updateSelectedText((data) => ({ ...data, printable: checked }))} /></div>
+                  <div className="inspect-section measurement-section"><div className="inspect-heading-row"><label>TEXT BOX SIZE</label><UnitToggle value={measurementUnit} onChange={setProjectUnit} label="Text box size unit" /></div><div className="two-inputs"><span>W ({measurementUnit})<Input aria-label={`Text box width in ${measurementUnit}`} type="number" value={formatMeasurement(selected.widthCm, measurementUnit)} min={.5} step={.1} onFocus={(event) => { event.currentTarget.select(); beginSizeEdit(); }} onBlur={endSizeEdit} onChange={(event) => changeSinglePrintSize('width', Number(event.target.value))} /></span><span>H ({measurementUnit})<Input aria-label={`Text box height in ${measurementUnit}`} type="number" value={formatMeasurement(selected.heightCm, measurementUnit)} min={.5} step={.1} onFocus={(event) => { event.currentTarget.select(); beginSizeEdit(); }} onBlur={endSizeEdit} onChange={(event) => changeSinglePrintSize('height', Number(event.target.value))} /></span></div></div>
+                  <div className="inspect-section rotation-control"><label>ROTATION <b>{Math.round(selected.rotation)}°</b></label><Slider aria-label={`Text rotation for ${selected.code}`} aria-valuetext={`${Math.round(selected.rotation)} degrees`} value={[selected.rotation]} min={-180} max={180} step={1} onValueChange={(value) => { beginHistoryTransaction(); markHistoryTransactionChanged(); updatePiece(selected.id, { rotation: sliderValue(value) }, false); }} onValueCommitted={endHistoryTransaction} /><div className="rotation-scale"><span>−180°</span><span>0°</span><span>180°</span></div></div>
+                  <div className="inspect-section lock-row"><div><label>LOCK POSITION</label><p>Composition never moves text; lock also prevents hand dragging.</p></div><Switch aria-label={`Lock position for ${selected.code}`} checked={selected.locked} onCheckedChange={(checked) => updatePiece(selected.id, { locked: checked })} /></div>
+                  <div className="inspect-section lock-row"><div><label>INCLUDE IN PRINT PACK</label><p>Print this text box at its exact wall size.</p></div><Switch aria-label="Include text in Print Pack" checked={selected.text.printable} onCheckedChange={(checked) => updateSelectedText((data) => ({ ...data, printable: checked }))} /></div>
                   <div className="inspect-actions"><Button variant="outline" onClick={duplicateSelected}><Copy /> Duplicate</Button><Button variant="destructive" disabled={selected.locked} onClick={requestRemoveSelected}><Trash2 /> Delete text…</Button></div>
                 </> : <>
                   <div className="inspect-hero"><img src={selected.src} alt={selected.name} /><span style={{ background: selected.color }} /><div><small>{selected.category}</small><h2>{selected.code}</h2><p>{selected.name}</p></div></div>
@@ -3672,7 +3756,7 @@ export function StudioApp() {
                     <div className="nudge-row"><button onClick={() => updatePiece(selected.id, { rotation: 0 })}>Straighten · 0°</button><button aria-pressed={Math.abs(selected.rotation - 90) < 0.5} onClick={() => updatePiece(selected.id, { rotation: 90 })}><RotateCw /> Horizontal · 90°</button></div>
                   </div>
                   <PhotoBorderEditor pieces={[selected]} unit={measurementUnit} onChange={updateSelectedPhotoBorders} onBeginContinuous={beginHistoryTransaction} onEndContinuous={endHistoryTransaction} />
-                  <div className="inspect-section lock-row"><div><label>LOCK POSITION</label><p>AI layouts will leave this piece exactly here.</p></div><Switch checked={selected.locked} onCheckedChange={(checked) => updatePiece(selected.id, { locked: checked })} /></div>
+                  <div className="inspect-section lock-row"><div><label>LOCK POSITION</label><p>AI layouts will leave this piece exactly here.</p></div><Switch aria-label={`Lock position for ${selected.code}`} checked={selected.locked} onCheckedChange={(checked) => updatePiece(selected.id, { locked: checked })} /></div>
                   <div className="inspect-actions"><Button variant="outline" disabled={Boolean(cropSession)} onClick={duplicateSelected}><Copy /> Duplicate</Button><Button variant="outline" className="remove-from-wall" disabled={Boolean(cropSession)} onClick={() => togglePiecePlacement(selected)}>{selected.placed ? <BoxSelect /> : <Plus />}{selected.placed ? 'Remove from wall' : 'Place on wall'}</Button><Button variant="outline" disabled={!selected.placed || Boolean(cropSession)} onClick={() => startCrop(selected)}><Crop /> Crop & frame</Button><Button variant="destructive" disabled={selected.locked || Boolean(cropSession)} onClick={requestRemoveSelected}><Trash2 /> Delete from project…</Button></div>
                 </>}
               </div>
@@ -3688,13 +3772,13 @@ export function StudioApp() {
               <div className="assistant-content">
                 <div className="ai-heading"><span><Sparkles /></span><div><small>LAYOUT ASSISTANT</small><h2>Ask Cutroom</h2></div><i>{aiMode === 'openai' ? 'OPENAI' : aiMode === 'local' ? 'LOCAL FALLBACK' : 'SECURE AI'}</i></div>
                 <div className="assistant-copy"><p>Describe any shape or visual rhythm—heart, wave, left ladder, spiral, or something entirely new. AI places rigid wall units while Cutroom protects their exact sizes.</p><div className="quick-prompts"><button onClick={() => setPrompt('Compare the wall items by physical size and arrange them as a ladder rising to the right, largest at the bottom.')}>Size ladder</button><button onClick={() => setPrompt('Arrange the wall items in a clear heart silhouette with balanced visual weight.')}>Heart</button><button onClick={() => setPrompt('Create a playful flowing wave, alternating warm and cool images along the curve.')}>Color wave</button></div><Textarea value={prompt} maxLength={MAX_AI_BRIEF_LENGTH} onChange={(event) => setPrompt(event.target.value)} aria-label="Layout brief" /></div>
-                <div className="control-section"><label>GROUP BY <b>{groupStrength}%</b></label><div className="range-labels"><span>Color contrast</span><span>Theme</span></div><Slider value={[groupStrength]} onValueChange={(value) => setGroupStrength(sliderValue(value))} className="accent-slider" /></div>
+                <div className="control-section"><label>GROUP BY <b>{groupStrength}%</b></label><div className="range-labels"><span>Color contrast</span><span>Theme</span></div><Slider aria-label="Group by theme versus color contrast" aria-valuetext={`${groupStrength}% theme`} value={[groupStrength]} onValueChange={(value) => setGroupStrength(sliderValue(value))} className="accent-slider" /></div>
                 <div className="control-section"><label>CLASSIC TEMPLATES {layout === 'custom' && <b>AI CUSTOM ACTIVE</b>}</label><div className="choice-grid six">{layouts.map((item) => <button key={item.id} className={layout === item.id ? 'active' : ''} onClick={() => applyTemplate(item.id)}><i className={`shape ${item.id}`} /><span>{item.name}<small>{item.note}</small></span></button>)}</div></div>
-                <div className="control-section compact"><label>DENSITY <b>{density < 40 ? 'Airy' : density > 75 ? 'Packed' : 'Balanced'}</b></label><Slider value={[density]} onValueChange={(value) => setDensity(sliderValue(value))} /></div>
+                <div className="control-section compact"><label>DENSITY <b>{density < 40 ? 'Airy' : density > 75 ? 'Packed' : 'Balanced'}</b></label><Slider aria-label="Layout density" aria-valuetext={`${density}%`} value={[density]} onValueChange={(value) => setDensity(sliderValue(value))} /></div>
                 <div className="ai-note"><WandSparkles /><p><b>Why this works.</b> {aiResponse}</p></div>
                 <Button className="generate-button" disabled={aiBusy} aria-busy={aiBusy} onClick={() => { void runAssistant(); }}><Send /> {aiBusy ? 'Thinking about your wall…' : 'Arrange from my brief'} <span>⌘ ↵</span></Button>
                 <button className="candidate-link" onClick={() => setCandidateOpen(true)}><Layers3 /> Browse classic templates</button>
-                <p className="privacy-note"><Lock /> {aiMode === 'local' ? 'Local fallback used—nothing was sent.' : 'Only your brief and piece details are sent. Photo files stay in this browser.'}</p>
+                <p className="privacy-note"><Lock /> {aiMode === 'local' ? 'AI unavailable. This fallback arrangement was calculated on your device.' : 'Only your brief and piece details are sent. Photo files stay in this browser.'}</p>
               </div>
             )}
           </aside>
@@ -3721,7 +3805,7 @@ export function StudioApp() {
             <div className="panel-heading"><div><span>PRINT PACKER</span><h2>Save paper & time</h2></div><Scissors /></div>
             <div className="print-intro">Pack the photos and printable text placed on your wall. Every item starts at its exact wall size—even when all sizes differ.</div>
             <div className="print-unit-row"><span>MEASUREMENTS</span><UnitToggle value={measurementUnit} onChange={setProjectUnit} label="Print pack measurement unit" /></div>
-            <div className="print-control"><label>PAPER SIZE</label><div className="two-inputs"><NativeSelect value={printPaper} onChange={(event) => changePrintPaper(event.target.value as keyof typeof PAPER_SIZES | 'Custom')}><NativeSelectOption value="A6">A6</NativeSelectOption><NativeSelectOption value="A5">A5</NativeSelectOption><NativeSelectOption value="A4">A4</NativeSelectOption><NativeSelectOption value="A3">A3</NativeSelectOption><NativeSelectOption value="A2">A2</NativeSelectOption><NativeSelectOption value="A1">A1</NativeSelectOption><NativeSelectOption value="Custom">Custom</NativeSelectOption></NativeSelect><button className={printLandscape ? 'active' : ''} onClick={togglePrintLandscape}><RotateCcw /> {printLandscape ? 'Landscape' : 'Portrait'}</button></div>{printPaper === 'Custom' && <div className="two-inputs custom-paper"><span>Width ({measurementUnit})<Input aria-label={`Custom sheet width in ${measurementUnit}`} type="number" value={formatMeasurement(customSheetW, measurementUnit)} min={formatMeasurement(10, measurementUnit)} max={formatMeasurement(200, measurementUnit)} step={measurementUnit === 'in' ? .05 : .1} onFocus={(event) => { event.currentTarget.select(); beginHistoryTransaction(); }} onBlur={endHistoryTransaction} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} onChange={(event) => { const value = Number(event.target.value); if (value > 0) { const widthCm = fromDisplayUnit(value, measurementUnit); if (Math.abs(widthCm - customSheetW) >= 0.0001) { beginHistoryTransaction(); markHistoryTransactionChanged(); setCustomSheetW(widthCm); setPrintPage(0); } } }} /></span><span>Height ({measurementUnit})<Input aria-label={`Custom sheet height in ${measurementUnit}`} type="number" value={formatMeasurement(customSheetH, measurementUnit)} min={formatMeasurement(10, measurementUnit)} max={formatMeasurement(200, measurementUnit)} step={measurementUnit === 'in' ? .05 : .1} onFocus={(event) => { event.currentTarget.select(); beginHistoryTransaction(); }} onBlur={endHistoryTransaction} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} onChange={(event) => { const value = Number(event.target.value); if (value > 0) { const heightCm = fromDisplayUnit(value, measurementUnit); if (Math.abs(heightCm - customSheetH) >= 0.0001) { beginHistoryTransaction(); markHistoryTransactionChanged(); setCustomSheetH(heightCm); setPrintPage(0); } } }} /></span></div>}</div>
+            <div className="print-control"><label>PAPER SIZE</label><div className="two-inputs"><NativeSelect aria-label="Print paper size" value={printPaper} onChange={(event) => changePrintPaper(event.target.value as keyof typeof PAPER_SIZES | 'Custom')}><NativeSelectOption value="A6">A6</NativeSelectOption><NativeSelectOption value="A5">A5</NativeSelectOption><NativeSelectOption value="A4">A4</NativeSelectOption><NativeSelectOption value="A3">A3</NativeSelectOption><NativeSelectOption value="A2">A2</NativeSelectOption><NativeSelectOption value="A1">A1</NativeSelectOption><NativeSelectOption value="Custom">Custom</NativeSelectOption></NativeSelect><button className={printLandscape ? 'active' : ''} onClick={togglePrintLandscape}><RotateCcw /> {printLandscape ? 'Landscape' : 'Portrait'}</button></div>{printPaper === 'Custom' && <div className="two-inputs custom-paper"><span>Width ({measurementUnit})<Input aria-label={`Custom sheet width in ${measurementUnit}`} type="number" value={formatMeasurement(customSheetW, measurementUnit)} min={formatMeasurement(10, measurementUnit)} max={formatMeasurement(200, measurementUnit)} step={measurementUnit === 'in' ? .05 : .1} onFocus={(event) => { event.currentTarget.select(); beginHistoryTransaction(); }} onBlur={endHistoryTransaction} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} onChange={(event) => { const value = Number(event.target.value); if (value > 0) { const widthCm = fromDisplayUnit(value, measurementUnit); if (Math.abs(widthCm - customSheetW) >= 0.0001) { beginHistoryTransaction(); markHistoryTransactionChanged(); setCustomSheetW(widthCm); setPrintPage(0); } } }} /></span><span>Height ({measurementUnit})<Input aria-label={`Custom sheet height in ${measurementUnit}`} type="number" value={formatMeasurement(customSheetH, measurementUnit)} min={formatMeasurement(10, measurementUnit)} max={formatMeasurement(200, measurementUnit)} step={measurementUnit === 'in' ? .05 : .1} onFocus={(event) => { event.currentTarget.select(); beginHistoryTransaction(); }} onBlur={endHistoryTransaction} onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} onChange={(event) => { const value = Number(event.target.value); if (value > 0) { const heightCm = fromDisplayUnit(value, measurementUnit); if (Math.abs(heightCm - customSheetH) >= 0.0001) { beginHistoryTransaction(); markHistoryTransactionChanged(); setCustomSheetH(heightCm); setPrintPage(0); } } }} /></span></div>}</div>
             <div className="print-source-card"><span><Link2 /> SIZE SOURCE</span><b>{globalPrintScalePercent === null ? 'Mixed print-only sizes' : globalPrintScalePercent === 100 ? 'Actual wall sizes' : `${Math.round(globalPrintScalePercent)}% of wall sizes`}</b><p>The packer moves rectangles to save pages. It never enlarges them automatically to fill blank paper.</p></div>
             <div className={`print-control global-print-scale ${globalPrintScalePercent === null ? 'mixed' : ''}`}>
               <div className="global-scale-heading"><label>ALL ITEMS SCALE <b>{globalPrintScalePercent === null ? 'MIXED' : `${Math.round(globalPrintScalePercent)}%`}</b></label><button type="button" disabled={!Object.keys(printOverrides).length} onClick={resetGlobalPrintScale}><RotateCcw /> Original 100%</button></div>
@@ -3755,9 +3839,9 @@ export function StudioApp() {
                 <div className="print-override-actions"><button disabled={!printSelectedHasOverride} onClick={resetPrintPieceSize}><RotateCcw /> Reset to wall</button><button disabled={!printSelectedHasOverride || printSelectedContent.kind === 'group'} onClick={updateWallFromPrintSize}><Move /> Update wall size too</button></div>
               </> : <div className="print-empty-editor"><ImagePlus /><b>No printable wall items</b><span>Place a photo or enable Print Pack for a text box.</span></div>}
             </div>
-            <div className="print-control"><label>CUT SPACING <b>{measurementText(printGap, measurementUnit)}</b></label><Slider aria-label="Cut spacing" aria-valuetext={measurementText(printGap, measurementUnit)} value={[printGap]} min={0} max={2} step={0.1} onValueChange={(value) => { const gap = sliderValue(value); if (Math.abs(gap - printGap) < 0.0001) return; beginHistoryTransaction(); markHistoryTransactionChanged(); setPrintGap(gap); }} onValueCommitted={endHistoryTransaction} />{zeroCutSpacing && <p className="print-setting-note info"><Scissors /> Photos touch. Crop marks may overlap between pieces.</p>}</div>
+            <div className="print-control"><label>CUT SPACING <b>{measurementText(printGap, measurementUnit)}</b></label><Slider aria-label="Cut spacing" aria-valuetext={measurementText(printGap, measurementUnit)} value={[printGap]} min={0} max={2} step={0.1} onValueChange={(value) => { const gap = sliderValue(value); if (Math.abs(gap - printGap) < 0.0001) return; beginHistoryTransaction(); markHistoryTransactionChanged(); setPrintGap(gap); }} onValueCommitted={endHistoryTransaction} />{zeroCutSpacing && <p className="print-setting-note info"><Scissors /> Photos touch. Only crop marks that fit on blank paper are printed.</p>}</div>
             <div className="print-control"><label>PAGE MARGIN <b>{measurementText(printMargin, measurementUnit)}</b></label><Slider aria-label="Page margin" aria-valuetext={measurementText(printMargin, measurementUnit)} value={[printMargin]} min={0} max={3} step={0.1} onValueChange={(value) => { const margin = sliderValue(value); if (Math.abs(margin - printMargin) < 0.0001) return; beginHistoryTransaction(); markHistoryTransactionChanged(); setPrintMargin(margin); }} onValueCommitted={endHistoryTransaction} />{lowPageMargin && <output className="print-setting-note warning"><TriangleAlert /> Below {measurementText(0.3, measurementUnit)}, many printers may clip edge content. Export is still allowed.</output>}</div>
-            <div className="print-control toggle-row"><div><label>CROP MARKS</label><p>Tiny corner guides for faster cutting.</p></div><Switch checked={cropMarks} onCheckedChange={changeCropMarks} /></div>
+            <div className="print-control toggle-row"><div><label>CROP MARKS</label><p>Tiny corner guides for faster cutting.</p></div><Switch aria-label="Print crop marks" checked={cropMarks} onCheckedChange={changeCropMarks} /></div>
             <div className={`fit-summary ${printPlan.unplaced.length ? 'invalid' : ''}`}><span><b>{printItems.length - printPlan.unplaced.length}</b> items packed</span><span><b>{totalPrintPages || '—'}</b> sheets total</span><span><b>{printPlan.unplaced.length ? 'Too big' : `${printPlan.sparePercent}%`}</b> blank area</span></div>
             {oversizedPrintDetails.length > 0 && <div className="oversize-panel">
               <div className="oversize-heading"><span><TriangleAlert /><b>{oversizedPrintDetails.length} {oversizedPrintDetails.length === 1 ? 'item is' : 'items are'} too large</b></span><button onClick={() => applyBestFitToOversized()}>Fit all safely</button></div>
@@ -3798,10 +3882,10 @@ export function StudioApp() {
                       <b>{content.code}</b>
                       <small>{measurementPairText(placement.widthCm, placement.heightCm, measurementUnit)}</small>
                       {rotated && <i className="sheet-rotation-badge" title={`${rotationText} on this print sheet`}>{placement.sheetRotation === -90 ? <RotateCcw /> : <RotateCw />} {rotationText}</i>}
-                      {cropMarks && <><i className="crop-mark tl" /><i className="crop-mark tr" /><i className="crop-mark bl" /><i className="crop-mark br" /></>}
                     </button>
                   );
                 })}
+                {pagePlan && cropMarks && <svg aria-hidden="true" className="print-safe-crop-marks" viewBox={`0 0 ${sheetW} ${sheetH}`} preserveAspectRatio="none" style={{ position: 'absolute', inset: 0, width: '100%', height: '100%', pointerEvents: 'none' }}>{printCropMarkSegments(pagePlan.placements, sheetW, sheetH).map((mark, index) => <line key={index} {...mark} stroke="#262624" strokeWidth={PRINT_MARK_WIDTH_CM} />)}</svg>}
                 {!pagePlan && <div className="empty-print-sheet"><ImagePlus /><b>No wall photos to pack</b><span>Place photos on the wall, then return here.</span></div>}
               </div>
               <div className="sheet-caption"><b>{printPaper} · {measurementPairText(sheetW, sheetH, measurementUnit)}</b><span>Exact relative scale preview · Download as PDF, PNG or JPG</span></div>
@@ -3831,7 +3915,7 @@ export function StudioApp() {
             <button type="button" aria-pressed={printExportFormat === 'jpg'} className={printExportFormat === 'jpg' ? 'active' : ''} onClick={() => choosePrintExportFormat('jpg')}><span className="format-icon jpg"><ImageIcon /></span><span><b>JPG</b><small>Smaller image files. Multiple sheets download as one ZIP.</small></span><i>{printExportFormat === 'jpg' && <Check />}</i></button>
           </fieldset>
           {printExportFormat !== 'pdf' && <div className="print-dpi-section"><div><b>IMAGE QUALITY</b><span>Pixel size includes print-density metadata</span></div><fieldset aria-label="Raster export quality"><button type="button" className={printDpi === 150 ? 'active' : ''} aria-pressed={printDpi === 150} onClick={() => setPrintDpi(150)}>150 DPI<small>Compact</small></button><button type="button" className={printDpi === 300 ? 'active' : ''} aria-pressed={printDpi === 300} disabled={!raster300Spec.supported} onClick={() => setPrintDpi(300)}>300 DPI<small>Print quality</small></button></fieldset><p>Print at 100% / Actual size. PDF remains the safest choice when exact physical dimensions are critical.</p>{!rasterSpec.supported && <p className="raster-limit" role="alert"><TriangleAlert /> {rasterSpec.reason}</p>}</div>}
-          {zeroCutSpacing && <div className="print-download-alert info"><Scissors /><p><b>Edge-to-edge packing</b><span>There is no cutting gap, so crop marks from neighbouring photos may touch.</span></p></div>}
+          {zeroCutSpacing && <div className="print-download-alert info"><Scissors /><p><b>Edge-to-edge packing</b><span>There is no cutting gap. Guides that would touch a photo are omitted; your images stay clean.</span></p></div>}
           {lowPageMargin && <div className="print-download-alert warning" role="alert"><TriangleAlert /><p><b>Low page margin: {measurementText(printMargin, measurementUnit)}</b><span>Many home printers need at least {measurementText(0.3, measurementUnit)}. Borderless printers and print shops can continue, but an ordinary printer may clip the outer edge.</span></p></div>}
           <DialogFooter><Button variant="outline" onClick={() => setPrintDownloadOpen(false)}>Cancel</Button><Button onClick={() => void performPrintExport()} disabled={Boolean(busy) || (printExportFormat !== 'pdf' && !rasterSpec.supported)}><Download /> {lowPageMargin ? `Download anyway as ${printExportFormat.toUpperCase()}` : `Download ${printExportFormat.toUpperCase()}`}</Button></DialogFooter>
         </DialogContent>
@@ -3842,39 +3926,42 @@ export function StudioApp() {
           <DialogHeader><DialogTitle>What did you upload?</DialogTitle><DialogDescription>We’ll keep the original untouched. Choose how it should enter the project.</DialogDescription></DialogHeader>
           {pendingAsset && <div className="import-preview"><img src={pendingAsset.src} alt={pendingAsset.name} /><span>{pendingAsset.name}<b>{pendingAsset.pixelW} × {pendingAsset.pixelH} px</b></span></div>}
           <div className="import-choices"><button onClick={() => pendingAsset && addSingleAsset(pendingAsset)}><FileImage /><span><b>One finished poster</b><small>Keep the whole image and assign a print size.</small></span><ChevronDown /></button><button onClick={openCutter}><Scissors /><span><b>A sheet with many photos</b><small>Use a grid, editable AI suggestions, or draw shaped cuts yourself.</small></span><ChevronDown /></button></div>
-          <div className="import-size"><label>Finished poster size</label><UnitToggle value={measurementUnit} onChange={setProjectUnit} label="Imported poster measurement unit" /><NativeSelect value={posterPreset} onChange={(event) => setPosterPreset(event.target.value as PhotoSizePreset)}><NativeSelectOption value="Original">Original proportions · no crop</NativeSelectOption><NativeSelectOption value="A6">A6 · {measurementPairText(10.5, 14.8, measurementUnit)}</NativeSelectOption><NativeSelectOption value="A5">A5 · {measurementPairText(14.8, 21, measurementUnit)}</NativeSelectOption><NativeSelectOption value="A4">A4 · {measurementPairText(21, 29.7, measurementUnit)}</NativeSelectOption><NativeSelectOption value="A3">A3 · {measurementPairText(29.7, 42, measurementUnit)}</NativeSelectOption><NativeSelectOption value="A2">A2 · {measurementPairText(42, 59.4, measurementUnit)}</NativeSelectOption><NativeSelectOption value="A1">A1 · {measurementPairText(59.4, 84.1, measurementUnit)}</NativeSelectOption></NativeSelect>{posterPreset === 'Original' && <small className="original-size-note">Keeps the file’s exact ratio without cropping. Its starting print size is editable in Inspect.</small>}</div>
+          <div className="import-size"><label>Finished poster size</label><UnitToggle value={measurementUnit} onChange={setProjectUnit} label="Imported poster measurement unit" /><NativeSelect aria-label="Default photo size" value={posterPreset} onChange={(event) => setPosterPreset(event.target.value as PhotoSizePreset)}><NativeSelectOption value="Original">Original proportions · no crop</NativeSelectOption><NativeSelectOption value="A6">A6 · {measurementPairText(10.5, 14.8, measurementUnit)}</NativeSelectOption><NativeSelectOption value="A5">A5 · {measurementPairText(14.8, 21, measurementUnit)}</NativeSelectOption><NativeSelectOption value="A4">A4 · {measurementPairText(21, 29.7, measurementUnit)}</NativeSelectOption><NativeSelectOption value="A3">A3 · {measurementPairText(29.7, 42, measurementUnit)}</NativeSelectOption><NativeSelectOption value="A2">A2 · {measurementPairText(42, 59.4, measurementUnit)}</NativeSelectOption><NativeSelectOption value="A1">A1 · {measurementPairText(59.4, 84.1, measurementUnit)}</NativeSelectOption></NativeSelect>{posterPreset === 'Original' && <small className="original-size-note">Keeps the file’s exact ratio without cropping. Its starting print size is editable in Inspect.</small>}</div>
         </DialogContent>
       </Dialog>
 
-      <Dialog open={cutOpen} onOpenChange={setCutOpen}>
-        <DialogContent className="cutroom-dialog cutter-dialog" showCloseButton={false}>
-          <div className="cutter-head"><div><span>CUTOUT STUDIO</span><h2>Find, shape, then approve</h2></div><button onClick={() => setCutOpen(false)} aria-label="Close cutter"><X /></button></div>
-          <div className="cutter-body">
+      <Dialog open={cutOpen} onOpenChange={changeCutterOpen}>
+        <DialogContent className="cutroom-dialog cutter-dialog" showCloseButton={false} aria-busy={cutCreating}>
+          <DialogTitle className="sr-only">Cutout Studio</DialogTitle>
+          <DialogDescription className="sr-only">Review and edit the proposed cuts. New pieces are added only when you choose Create cutouts.</DialogDescription>
+          <div className="cutter-head"><div><span>CUTOUT STUDIO</span><h2>Find, shape, then approve</h2></div><button onClick={() => changeCutterOpen(false)} disabled={cutCreating} aria-label="Close cutter"><X /></button></div>
+          <div className="cutter-body" inert={cutCreating || undefined}>
             <aside>
               <label>METHOD</label>
               <div className="method-toggle cut-method-toggle">
-                <button className={cutMode === 'grid' ? 'active' : ''} onClick={() => { setCutMode('grid'); setCutPreviewMode('edit'); setSelectedCutId(null); }}><Grid3X3 /> Grid</button>
-                <button className={cutMode === 'ai' ? 'active' : ''} onClick={() => { setCutMode('ai'); setCutPreviewMode(cutRegions.length ? 'result' : 'edit'); setSelectedCutId(cutRegions[0]?.id ?? null); }}><WandSparkles /> AI detect</button>
-                <button className={cutMode === 'manual' ? 'active' : ''} onClick={() => { setCutMode('manual'); setCutPreviewMode('edit'); setSelectedCutId(cutRegions[0]?.id ?? null); }}><Crop /> Manual</button>
+                <button className={cutMode === 'grid' ? 'active' : ''} onClick={() => changeCutMode('grid')}><Grid3X3 /> Grid</button>
+                <button className={cutMode === 'ai' ? 'active' : ''} onClick={() => changeCutMode('ai')}><WandSparkles /> AI detect</button>
+                <button className={cutMode === 'manual' ? 'active' : ''} onClick={() => changeCutMode('manual')}><Crop /> Manual</button>
               </div>
 
               {cutMode === 'grid' && <>
                 <label>GRID</label>
-                <div className="two-inputs"><span>Rows<Input type="number" min={1} max={10} value={rows} onChange={(event) => setRows(clamp(Number(event.target.value), 1, 10))} /></span><span>Columns<Input type="number" min={1} max={10} value={columns} onChange={(event) => setColumns(clamp(Number(event.target.value), 1, 10))} /></span></div>
+                <div className="two-inputs"><span>Rows<Input aria-label="Cut grid rows" type="number" min={1} max={10} step={1} value={rows} onChange={(event) => setRows(Math.round(clamp(Number(event.target.value), 1, 10)))} /></span><span>Columns<Input aria-label="Cut grid columns" type="number" min={1} max={10} step={1} value={columns} onChange={(event) => setColumns(Math.round(clamp(Number(event.target.value), 1, 10)))} /></span></div>
                 <p>Fastest for evenly divided sheets. Every source pixel, including the printed grid-line area, stays inside a cutout.</p>
                 <button type="button" className="fine-tune-grid" onClick={fineTuneGrid}><Move /> Fine-tune this grid</button>
               </>}
 
               {cutMode === 'ai' && <>
                 <label>WHAT SHOULD AI FIND?</label>
-                <Textarea value={aiCutBrief} maxLength={1200} rows={4} onChange={(event) => setAiCutBrief(event.target.value)} placeholder="Example: Find the 3 couples and suggest one heart around each couple." />
+                <Textarea aria-label="AI cutout instructions" value={aiCutBrief} maxLength={1200} rows={4} onChange={(event) => { cancelAiCutout(); setAiCutError(''); setAiCutBrief(event.target.value); }} placeholder="Example: Find the 3 couples and suggest one heart around each couple." />
                 <label>PREFERRED SHAPE</label>
-                <NativeSelect value={aiCutShapePreference} onChange={(event) => setAiCutShapePreference(event.target.value as AiCutoutShapePreference)}>
+                <NativeSelect aria-label="AI cutout preferred shape" value={aiCutShapePreference} onChange={(event) => { cancelAiCutout(); setAiCutError(''); setAiCutShapePreference(event.target.value as AiCutoutShapePreference); }}>
                   {AI_CUTOUT_SHAPE_PREFERENCES.map((shape) => <NativeSelectOption key={shape} value={shape}>{AI_CUTOUT_SHAPE_LABELS[shape]}</NativeSelectOption>)}
                 </NativeSelect>
                 <button type="button" className="ai-cut-detect" disabled={aiCutBusy} onClick={() => void runAiCutout()}><Sparkles /> {aiCutBusy ? 'Finding separate regions…' : 'Find editable cuts'}</button>
+                {aiCutBusy && <button type="button" className="fine-tune-grid" onClick={cancelAiCutout}><X /> Cancel detection</button>}
                 <p className="ai-review-note"><TriangleAlert /> AI suggests geometry only. Inspect every edge and adjust it before creating files.</p>
-                {aiCutError && <div className="ai-cut-status error" role="alert"><TriangleAlert /><span><b>Detection didn’t finish</b><small>{aiCutError}</small></span><button type="button" onClick={() => void runAiCutout()}>Retry</button></div>}
+                {aiCutError && <div className="ai-cut-status error" role="alert"><TriangleAlert /><span><b>Detection didn’t finish</b><small>{aiCutError}</small></span><button type="button" disabled={aiCutBusy} onClick={() => void runAiCutout()}>Retry</button></div>}
                 {!aiCutError && cutRegions.some(({ source }) => source === 'ai-vision') && <output className="ai-cut-status success"><Check /><span><b>{cutRegions.length} editable cuts found</b><small>Preview them, then edit any region that needs correction.</small></span></output>}
               </>}
 
@@ -3884,15 +3971,15 @@ export function StudioApp() {
                   {CUT_SHAPES.map((shape) => {
                     const selectedRegion = cutRegions.find(({ id }) => id === selectedCutId);
                     const pressed = selectedRegion ? selectedRegion.shape === shape : activeCutShape === shape;
-                    return <button key={shape} type="button" className={pressed ? 'active' : ''} aria-pressed={pressed} onClick={() => changeSelectedCutShape(shape)}><span className={`cut-shape-swatch ${shape}`} />{CUT_SHAPE_LABELS[shape]}</button>;
+                    return <button key={shape} type="button" disabled={aiCutBusy} className={pressed ? 'active' : ''} aria-pressed={pressed} onClick={() => { setCutPreviewMode('edit'); changeSelectedCutShape(shape); }}><span className={`cut-shape-swatch ${shape}`} />{CUT_SHAPE_LABELS[shape]}</button>;
                   })}
                 </div>
                 <p>{activeCutShape === 'polygon' ? 'Click point by point, then click the first dot or Finish shape. Every point stays editable.' : 'Drag on empty image space to add a cut. Drag a cut to move it; use any side or corner handle to resize it.'}</p>
                 <div className="manual-actions cut-review-actions">
-                  <button type="button" onClick={() => setSelectedCutId(null)}><Plus /> Add another</button>
-                  <button type="button" onClick={removeSelectedCut} disabled={!selectedCutId}><Trash2 /> Delete selected</button>
-                  <button type="button" onClick={undoLastCutRegion} disabled={!cutRegions.length}><Undo2 /> Undo last</button>
-                  <button type="button" onClick={() => { updateCutRegions([]); setSelectedCutId(null); }} disabled={!cutRegions.length}><X /> Clear all</button>
+                  <button type="button" disabled={aiCutBusy} onClick={() => { setSelectedCutId(null); setCutPreviewMode('edit'); }}><Plus /> Add another</button>
+                  <button type="button" onClick={removeSelectedCut} disabled={aiCutBusy || !selectedCutId}><Trash2 /> Delete selected</button>
+                  <button type="button" onClick={undoLastCutRegion} disabled={aiCutBusy || !cutRegions.length}><Undo2 /> Undo last</button>
+                  <button type="button" onClick={() => { updateCutRegions([]); setSelectedCutId(null); setCutPreviewMode('edit'); }} disabled={aiCutBusy || !cutRegions.length}><X /> Clear all</button>
                 </div>
               </>}
 
@@ -3906,7 +3993,7 @@ export function StudioApp() {
                 <button type="button" className={cutPreviewMode === 'result' ? 'active' : ''} aria-pressed={cutPreviewMode === 'result'} disabled={(cutMode === 'grid' ? gridRegions.length : cutRegions.length) === 0} onClick={() => setCutPreviewMode('result')}><Eye /> Preview cuts <b>{cutMode === 'grid' ? gridRegions.length : cutRegions.length}</b></button>
                 <span>LIVE PREVIEW · NOTHING CREATED YET</span>
               </fieldset>
-              {pendingAsset && cutPreviewMode === 'edit' && <CutoutCanvas
+              {pendingAsset && cutPreviewMode === 'edit' && <div className="cut-editor-viewport"><CutoutCanvas
                 asset={{ src: pendingAsset.src, alt: `Sheet being cut: ${pendingAsset.name}`, pixelW: pendingAsset.pixelW, pixelH: pendingAsset.pixelH }}
                 regions={cutMode === 'grid' ? gridRegions : cutRegions}
                 activeShape={activeCutShape}
@@ -3916,10 +4003,10 @@ export function StudioApp() {
                 createRegionId={createCutRegionId}
                 metadata={aiCutMeta}
                 editable={cutMode !== 'grid'}
-                disabled={aiCutBusy}
+                disabled={aiCutBusy || cutCreating}
                 className={`cut-preview ${cutMode}`}
                 source={cutMode === 'ai' ? 'manual-after-ai' : 'manual'}
-              />}
+              /></div>}
               {pendingAsset && cutPreviewMode === 'result' && <div className="cut-result-scroll"><CutoutResultPreview
                 asset={{ src: pendingAsset.src, alt: pendingAsset.name, pixelW: pendingAsset.pixelW, pixelH: pendingAsset.pixelH }}
                 regions={cutMode === 'grid' ? gridRegions : cutRegions}
@@ -3931,7 +4018,7 @@ export function StudioApp() {
               <p>{cutPreviewMode === 'result' ? <><b>Checkerboard areas will be transparent.</b> Click a preview to select it, then return to Edit regions for corrections.</> : cutMode === 'grid' ? <><b>Every source pixel is kept.</b> Grid lines are guides only; neighbouring cuts share the same source-pixel edge and include the outer border.</> : cutMode === 'ai' ? <><b>Dashed shapes are AI proposals.</b> Select, move, resize, reshape, add, or delete them—nothing is cut yet.</> : <><b>You control every cut.</b> Use geometric shapes or draw a custom outline point by point.</>}</p>
             </div>
           </div>
-          <DialogFooter className="cutter-footer"><span className="cut-approval-copy"><Check /> Review complete? Only this button creates new Pieces.</span><Button variant="outline" onClick={() => setCutOpen(false)}>Cancel</Button><Button onClick={createCutouts} disabled={aiCutBusy || (cutMode === 'grid' ? !gridRegions.length : !cutRegions.length)}><Scissors /> Create {cutMode === 'grid' ? gridRegions.length : cutRegions.length} cutouts</Button></DialogFooter>
+          <DialogFooter className="cutter-footer"><span className="cut-approval-copy"><Check /> Review complete? Only this button creates new Pieces.</span><Button variant="outline" disabled={cutCreating} onClick={() => changeCutterOpen(false)}>Cancel</Button><Button onClick={createCutouts} disabled={aiCutBusy || cutCreating || (cutMode === 'grid' ? !gridRegions.length : !cutRegions.length)}><Scissors /> {cutCreating ? 'Creating cutouts…' : `Create ${cutMode === 'grid' ? gridRegions.length : cutRegions.length} cutouts`}</Button></DialogFooter>
         </DialogContent>
       </Dialog>
 
@@ -3941,7 +4028,7 @@ export function StudioApp() {
           <div className="wall-settings">
             <div className="wall-unit-row"><label>MEASUREMENT UNIT</label><UnitToggle value={measurementUnit} onChange={setProjectUnit} label="Wall measurement unit" /></div>
             <label>QUICK SIZE</label>
-            <NativeSelect value={wallPreset} onChange={(event) => changeWallPreset(event.target.value)}>
+            <NativeSelect aria-label="Wall size preset" value={wallPreset} onChange={(event) => changeWallPreset(event.target.value)}>
               <NativeSelectOption value="custom">Custom size</NativeSelectOption>
               <NativeSelectOption value="desk">Desk wall · {measurementPairText(180, 110, measurementUnit)}</NativeSelectOption>
               <NativeSelectOption value="dorm">Bedroom · {measurementPairText(240, 160, measurementUnit)}</NativeSelectOption>
@@ -3994,7 +4081,7 @@ export function StudioApp() {
           { layout: 'compass' as const, reason: 'Build a central hero with supporting zones around it.' },
           { layout: 'organic' as const, reason: 'Create a loose, playful cloud with measured spacing.' },
           { layout: 'strip' as const, reason: 'Use clean cinematic bands for a strong reading rhythm.' },
-        ]).map(({ layout: name, reason }, index) => <button key={name} onClick={() => { applyTemplate(name); setAiResponse(reason); }}><div className={`candidate-mini ${name}`}>{Array.from({ length: 13 }, (_, n) => <i key={n} style={{ background: COLORS[n % COLORS.length] }} />)}</div><span><em>0{index + 1}</em><b>{layouts.find((item) => item.id === name)?.name}</b><small>{reason}</small></span></button>)}</div></DialogContent>
+        ]).map(({ layout: name, reason }, index) => <button key={name} onClick={() => { if (applyTemplate(name)) setAiResponse(reason); }}><div className={`candidate-mini ${name}`}>{Array.from({ length: 13 }, (_, n) => <i key={n} style={{ background: COLORS[n % COLORS.length] }} />)}</div><span><em>0{index + 1}</em><b>{layouts.find((item) => item.id === name)?.name}</b><small>{reason}</small></span></button>)}</div></DialogContent>
       </Dialog>
 
       <Dialog open={restoreOpen} onOpenChange={(open) => { if (open) setRestoreOpen(true); else closeRestore(); }}>
@@ -4019,7 +4106,7 @@ export function StudioApp() {
       </Dialog>
 
       <Dialog open={exportOpen} onOpenChange={setExportOpen}>
-        <DialogContent className="cutroom-dialog export-dialog"><DialogHeader><DialogTitle>Take the plan with you</DialogTitle><DialogDescription>Everything remains numbered so the digital design matches the pieces in your hands.</DialogDescription></DialogHeader><div className="export-options"><button onClick={exportWallPng}><FileImage /><span><b>Wall plan PNG</b><small>High-resolution numbered image for your phone.</small></span><Download /></button><button onClick={exportWallPdf}><FileText /><span><b>Installation PDF</b><small>Measured blueprint with a centre-out hanging guide.</small></span><Download /></button><button onClick={() => { setExportOpen(false); openPrintPack(); }}><Printer /><span><b>Print-sheet packer</b><small>Pack mixed wall-selected sizes efficiently on A6 through A1 or a custom sheet.</small></span><ChevronDown /></button><button onClick={exportProject}><FileArchive /><span><b>Download project backup</b><small>Portable JSON with photos, sizes, crops, IDs, print settings and placements.</small></span><Download /></button><button onClick={openBackupPicker}><Upload /><span><b>Restore project backup</b><small>Validate a Cutroom JSON backup, review it, then safely replace this project.</small></span><ChevronDown /></button></div>{storageHealth.supported && <div className={`export-storage-health ${storageNeedsAttention(storageHealth) ? 'warning' : ''}`}><span><Lock /></span><div><b>LOCAL STORAGE {storageHealth.persistent ? 'PROTECTED' : 'STANDARD'}</b><p>{storageHealth.usage !== undefined && storageHealth.quota !== undefined ? `${formatStorageBytes(storageHealth.usage)} of ${formatStorageBytes(storageHealth.quota)} used` : 'Your browser did not report a storage estimate.'}</p><small>Persistent storage reduces automatic browser cleanup; downloaded backups protect against device or browser-data loss.</small></div>{!storageHealth.persistent && <button onClick={() => { void protectLocalProject(); }}>Protect</button>}</div>}</DialogContent>
+        <DialogContent className="cutroom-dialog export-dialog"><DialogHeader><DialogTitle>Take the plan with you</DialogTitle><DialogDescription>Projects save in this browser on this site only. Before moving from localhost to the hosted site, download a backup here and restore it there.</DialogDescription></DialogHeader><div className="export-options"><button onClick={exportWallPng}><FileImage /><span><b>Wall plan PNG</b><small>High-resolution numbered image for your phone.</small></span><Download /></button><button onClick={exportWallPdf}><FileText /><span><b>Installation PDF</b><small>Measured blueprint with a centre-out hanging guide.</small></span><Download /></button><button onClick={() => { setExportOpen(false); openPrintPack(); }}><Printer /><span><b>Print-sheet packer</b><small>Pack mixed wall-selected sizes efficiently on A6 through A1 or a custom sheet.</small></span><ChevronDown /></button><button onClick={exportProject}><FileArchive /><span><b>Download project backup</b><small>Self-contained JSON with all images, sizes, crops, IDs, groups, print settings and placements.</small></span><Download /></button><button onClick={openBackupPicker}><Upload /><span><b>Restore project backup</b><small>Validate a Cutroom JSON backup, review it, then safely replace this project.</small></span><ChevronDown /></button></div>{storageHealth.supported && <div className={`export-storage-health ${storageNeedsAttention(storageHealth) ? 'warning' : ''}`}><span><Lock /></span><div><b>LOCAL STORAGE {storageHealth.persistent ? 'PROTECTED' : 'STANDARD'}</b><p>{storageHealth.usage !== undefined && storageHealth.quota !== undefined ? `${formatStorageBytes(storageHealth.usage)} of ${formatStorageBytes(storageHealth.quota)} used` : 'Your browser did not report a storage estimate.'}</p><small>Persistent storage reduces automatic browser cleanup; downloaded backups protect against device or browser-data loss.</small></div>{!storageHealth.persistent && <button onClick={() => { void protectLocalProject(); }}>Protect</button>}</div>}</DialogContent>
       </Dialog>
     </main>
   );

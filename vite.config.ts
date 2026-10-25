@@ -13,8 +13,10 @@ const { d1, r2 } = hostingConfig;
 const isCodexSeatbeltSandbox = process.env.CODEX_SANDBOX === 'seatbelt';
 
 const localBindingConfig = {
-  main: 'vinext/server/fetch-handler',
+  main: './worker.ts',
   compatibility_flags: ['nodejs_compat'],
+  durable_objects: { bindings: [{ name: 'AI_USAGE_LIMITER', class_name: 'AiUsageLimiter' }] },
+  migrations: [{ tag: 'v1-ai-usage', new_sqlite_classes: ['AiUsageLimiter'] }],
   d1_databases: d1
     ? [
         {
@@ -34,7 +36,8 @@ const localBindingConfig = {
     : [],
 };
 
-export default defineConfig(async () => {
+export default defineConfig(async ({ mode }) => {
+  const privateBeta = mode === 'private-beta';
   // Keep Wrangler and Miniflare state project-local. These are non-secret tool
   // settings; application environment belongs in ignored `.env*` files.
   process.env.WRANGLER_WRITE_LOGS ??= 'false';
@@ -51,8 +54,11 @@ export default defineConfig(async () => {
       : undefined,
     plugins: [
       vinext(),
-      sites(),
-      cloudflare({
+      ...(privateBeta ? [] : [sites()]),
+      cloudflare(privateBeta ? {
+        viteEnvironment: { name: 'rsc', childEnvironments: ['ssr'] },
+        configPath: './wrangler.private-beta.jsonc',
+      } : {
         viteEnvironment: { name: 'rsc', childEnvironments: ['ssr'] },
         config: localBindingConfig,
       }),

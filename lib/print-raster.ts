@@ -3,6 +3,7 @@ import { drawImageFrame } from '@/lib/image-frame';
 import { drawCanvasPhotoBorder, type PhotoBorder } from '@/lib/photo-border';
 import { drawTextFrame, type TextPieceData } from '@/lib/text-elements';
 import type { PrintContent } from '@/lib/print-content';
+import { isPrintAnnotationClear, printCropMarkSegments, PRINT_MARK_WIDTH_CM } from './print-annotations.ts';
 
 export type RasterPrintFormat = 'png' | 'jpg';
 export type RasterPrintDpi = 150 | 300;
@@ -156,25 +157,6 @@ async function bitmapFromSource(src: string) {
   return createImageBitmap(await response.blob());
 }
 
-function drawCropMarks(context: CanvasRenderingContext2D, x: number, y: number, width: number, height: number, pixelsPerCm: number) {
-  const offset = 0.04 * pixelsPerCm;
-  const mark = 0.22 * pixelsPerCm;
-  context.save();
-  context.strokeStyle = '#262624';
-  context.lineWidth = Math.max(1, 0.4 / 72 * pixelsPerCm * CM_PER_INCH);
-  context.beginPath();
-  context.moveTo(x - offset - mark, y); context.lineTo(x - offset, y);
-  context.moveTo(x, y - offset - mark); context.lineTo(x, y - offset);
-  context.moveTo(x + width + offset, y); context.lineTo(x + width + offset + mark, y);
-  context.moveTo(x + width, y - offset - mark); context.lineTo(x + width, y - offset);
-  context.moveTo(x - offset - mark, y + height); context.lineTo(x - offset, y + height);
-  context.moveTo(x, y + height + offset); context.lineTo(x, y + height + offset + mark);
-  context.moveTo(x + width + offset, y + height); context.lineTo(x + width + offset + mark, y + height);
-  context.moveTo(x + width, y + height + offset); context.lineTo(x + width, y + height + offset + mark);
-  context.stroke();
-  context.restore();
-}
-
 function pageFileName(snapshot: RasterPrintSnapshot, format: RasterPrintFormat, dpi: RasterPrintDpi, pageIndex: number) {
   const paper = snapshot.paperName.replace(/[^a-z0-9-]+/gi, '-');
   return `cutroom-${paper}-${dpi}dpi-page-${String(pageIndex + 1).padStart(2, '0')}.${format}`;
@@ -258,16 +240,26 @@ export async function createRasterPrintExport(
           context.restore();
         }
         context.restore();
-        if (snapshot.cropMarks) drawCropMarks(context, x, y, footprintWidth, footprintHeight, pixelsPerCm);
-
         const labelY = y + footprintHeight + 0.18 * pixelsPerCm;
         const labelSize = Math.max(7, 4.2 / 72 * dpi);
-        if (snapshot.cutSpacingCm >= 0.3 && labelY + labelSize <= canvas.height) {
+        context.font = `700 ${labelSize}px Arial, sans-serif`;
+        const labelRect = { x: placement.xCm + .02, y: labelY / pixelsPerCm, w: context.measureText(content.code).width / pixelsPerCm, h: labelSize * 1.3 / pixelsPerCm };
+        if (snapshot.cutSpacingCm >= 0.3 && isPrintAnnotationClear(labelRect, snapshot.pages[pageIndex].placements, snapshot.sheetWidthCm, snapshot.sheetHeightCm)) {
           context.fillStyle = '#595957';
-          context.font = `700 ${labelSize}px Arial, sans-serif`;
           context.textBaseline = 'top';
           context.fillText(content.code, x + 0.02 * pixelsPerCm, labelY);
         }
+      }
+
+      if (snapshot.cropMarks) {
+        context.strokeStyle = '#262624';
+        context.lineWidth = PRINT_MARK_WIDTH_CM * pixelsPerCm;
+        context.beginPath();
+        for (const mark of printCropMarkSegments(snapshot.pages[pageIndex].placements, snapshot.sheetWidthCm, snapshot.sheetHeightCm)) {
+          context.moveTo(mark.x1 * pixelsPerCm, mark.y1 * pixelsPerCm);
+          context.lineTo(mark.x2 * pixelsPerCm, mark.y2 * pixelsPerCm);
+        }
+        context.stroke();
       }
 
       const encoded = await canvasToBlob(canvas, mimeType, format === 'jpg' ? 0.95 : undefined);

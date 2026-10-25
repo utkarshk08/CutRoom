@@ -13,7 +13,8 @@ const geistMono = Geist_Mono({
 });
 
 export const metadata: Metadata = {
-  metadataBase: new URL('https://cutroom-wall-studio.capital0ledger.chatgpt.site'),
+  metadataBase: new URL(process.env.APP_ORIGIN || 'http://localhost:3000'),
+  icons: { icon: '/favicon.svg' },
   title: 'Cutroom — Poster Wall Studio',
   description: 'Turn photos and collage sheets into measured, print-ready poster walls.',
   openGraph: {

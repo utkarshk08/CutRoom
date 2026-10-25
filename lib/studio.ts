@@ -554,7 +554,44 @@ function orderForGrouping(items: Piece[], groupStrength: number) {
   return items;
 }
 
-function applyLayoutToProxies(pieces: Piece[], layout: LayoutName, wall: Wall, density: number, groupStrength: number): Piece[] {
+function hasNewLayoutConflicts(before: Piece[], after: Piece[], wall: Wall) {
+  const outside = (piece: Piece) => {
+    const bounds = pieceVisualBounds(piece, wall);
+    return bounds.x < -.001 || bounds.y < -.001 || bounds.x + bounds.w > 100.001 || bounds.y + bounds.h > 100.001;
+  };
+  for (let i = 0; i < after.length; i += 1) {
+    if (!Number.isFinite(after[i].x) || !Number.isFinite(after[i].y)) return true;
+    if (outside(after[i]) && !outside(before[i])) return true;
+    for (let j = i + 1; j < after.length; j += 1) {
+      if (piecesOverlap(after[i], after[j], wall) && !piecesOverlap(before[i], before[j], wall)) return true;
+    }
+  }
+  return false;
+}
+
+/** Place rigid units atomically; never commit newly introduced collisions. */
+function placeLayoutProxies(pieces: Piece[], targets: Map<string, Piece>, wall: Wall, density: number, isSafe: (proposed: Piece[]) => boolean) {
+  const movable = pieces.filter((piece) => !piece.locked && targets.has(piece.id))
+    .sort((a, b) => b.w * b.h - a.w * a.h || a.id.localeCompare(b.id));
+  const fixed = pieces.filter((piece) => piece.locked || !targets.has(piece.id));
+  const attempt = (reservePending: boolean) => {
+    const placed = new Map<string, Piece>();
+    movable.forEach((piece, index) => {
+      const obstacles = [...fixed, ...placed.values(), ...(reservePending ? movable.slice(index + 1) : [])];
+      placed.set(piece.id, positionAtTarget(piece, targets.get(piece.id) ?? piece, obstacles, wall, density));
+    });
+    return pieces.map((piece) => placed.get(piece.id) ?? piece);
+  };
+  const proposed = attempt(false);
+  if (!hasNewLayoutConflicts(pieces, proposed, wall) && isSafe(proposed)) return proposed;
+  // The first pass may occupy the only space another large item can use.
+  // Retry while protecting not-yet-moved items at their current positions.
+  const reserved = attempt(true);
+  if (!hasNewLayoutConflicts(pieces, reserved, wall) && isSafe(reserved)) return reserved;
+  throw new Error('This arrangement would add overlaps or move photos past a wall edge at their current sizes. Try another composition or more wall space.');
+}
+
+function applyLayoutToProxies(pieces: Piece[], layout: LayoutName, wall: Wall, density: number, groupStrength: number, isSafe: (proposed: Piece[]) => boolean): Piece[] {
   const movable = pieces.filter((piece) => piece.placed && !piece.locked);
   const ordered = layout === 'flow'
     ? [...movable].sort((a, b) => ({ pastel: 0, warm: 1, neutral: 2, cool: 3, dark: 4 }[a.tone] - ({ pastel: 0, warm: 1, neutral: 2, cool: 3, dark: 4 }[b.tone])))
@@ -565,16 +602,7 @@ function applyLayoutToProxies(pieces: Piece[], layout: LayoutName, wall: Wall, d
         : layout === 'compass' ? compass(ordered, wall, density)
           : fitRows(ordered, wall, density);
   const targets = new Map(laid.map((piece) => [piece.id, piece]));
-  const fixed = pieces.filter((piece) => piece.locked && piece.placed).map((piece) => ({ ...piece }));
-  const placed = new Map<string, Piece>();
-  [...movable]
-    .sort((a, b) => b.w * b.h - a.w * a.h || a.id.localeCompare(b.id))
-    .forEach((piece) => {
-      const target = targets.get(piece.id) ?? piece;
-      const next = positionAtTarget(piece, target, [...fixed, ...placed.values()], wall, density);
-      placed.set(piece.id, next);
-    });
-  return pieces.map((piece) => piece.locked ? piece : placed.get(piece.id) ?? piece);
+  return placeLayoutProxies(pieces, targets, wall, density, isSafe);
 }
 
 function translateLayoutUnits(pieces: Piece[], units: LayoutUnit[], nextProxies: Map<string, Piece>) {
@@ -591,6 +619,16 @@ function translateLayoutUnits(pieces: Piece[], units: LayoutUnit[], nextProxies:
   });
 }
 
+function validateTranslatedLayout(pieces: Piece[], units: LayoutUnit[], wall: Wall) {
+  const before = pieces.filter((piece) => piece.placed);
+  return (proxies: Piece[]) => {
+    const after = translateLayoutUnits(before, units, new Map(proxies.map((proxy) => [proxy.id, proxy])));
+    // Rotated shapes can be separate even when their envelopes overlap. Such
+    // an envelope overlap must not exempt a new collision between real photos.
+    return !hasNewLayoutConflicts(before, after, wall);
+  };
+}
+
 export function applyLayout(
   pieces: Piece[],
   layout: LayoutName,
@@ -604,7 +642,7 @@ export function applyLayout(
   // translation so its overlap, text placement, rotation, and layer order stay intact.
   const units = buildLayoutUnits(pieces, groups, wall);
   const proxies = units.map(({ proxy }) => proxy);
-  const laid = applyLayoutToProxies(proxies, layout, wall, density, groupStrength);
+  const laid = applyLayoutToProxies(proxies, layout, wall, density, groupStrength, validateTranslatedLayout(pieces, units, wall));
   return translateLayoutUnits(pieces, units, new Map(laid.map((proxy) => [proxy.id, proxy])));
 }
 
@@ -617,23 +655,16 @@ export function applyCustomLayout(
 ): Piece[] {
   const units = buildLayoutUnits(pieces, groups, wall);
   const targetById = new Map(targets.map((target) => [target.unitId, target]));
-  const movable = units.filter((unit) => !unit.locked && targetById.has(unit.id));
-  const fixed = units.filter((unit) => unit.locked || !targetById.has(unit.id)).map(({ proxy }) => proxy);
-  const placed = new Map<string, Piece>();
-  [...movable]
-    .sort((a, b) => b.proxy.w * b.proxy.h - a.proxy.w * a.proxy.h || a.id.localeCompare(b.id))
-    .forEach((unit) => {
-      const target = targetById.get(unit.id);
-      if (!target) return;
-      const targetProxy = {
-        ...unit.proxy,
-        x: target.centerXPercent - unit.proxy.w / 2,
-        y: target.centerYPercent - unit.proxy.h / 2,
-      };
-      const next = positionAtTarget(unit.proxy, targetProxy, [...fixed, ...placed.values()], wall, density);
-      placed.set(unit.id, next);
-    });
-  return translateLayoutUnits(pieces, units, placed);
+  const targetProxies = new Map(units.flatMap((unit): Array<[string, Piece]> => {
+    const target = targetById.get(unit.id);
+    return target ? [[unit.id, {
+      ...unit.proxy,
+      x: target.centerXPercent - unit.proxy.w / 2,
+      y: target.centerYPercent - unit.proxy.h / 2,
+    }]] : [];
+  }));
+  const placed = placeLayoutProxies(units.map(({ proxy }) => proxy), targetProxies, wall, density, validateTranslatedLayout(pieces, units, wall));
+  return translateLayoutUnits(pieces, units, new Map(placed.map((proxy) => [proxy.id, proxy])));
 }
 
 type FreeRect = { x: number; y: number; w: number; h: number };

@@ -5,6 +5,10 @@ import {
   parseAiLayoutDecision,
   sanitizeAiLayoutRequest,
 } from '@/lib/ai-layout';
+import { AiRequestError, aiErrorResponse, readAiJson } from '@/lib/ai-request';
+import { readAiProviderError } from '@/lib/ai-provider-error';
+import { env } from 'cloudflare:workers';
+import { guardAiRequest, type AiAccessEnv } from '@/lib/ai-access';
 
 const OPENAI_RESPONSES_URL = 'https://api.openai.com/v1/responses';
 
@@ -38,6 +42,8 @@ function outputText(value: unknown) {
 }
 
 export async function POST(request: Request) {
+  const rejection = await guardAiRequest(request, env as AiAccessEnv, import.meta.env.DEV);
+  if (rejection) return rejection;
   const apiKey = process.env.OPENAI_API_KEY?.trim();
   if (!apiKey) {
     return json(
@@ -73,8 +79,9 @@ export async function POST(request: Request) {
 
   let input;
   try {
-    input = sanitizeAiLayoutRequest(await request.json());
+    input = sanitizeAiLayoutRequest(await readAiJson(request, 250_000));
   } catch (error) {
+    if (error instanceof AiRequestError) return aiErrorResponse(error);
     return json(
       {
         code: 'invalid_request',
@@ -94,9 +101,11 @@ export async function POST(request: Request) {
     Math.max(1_200, 800 + movableIds.length * 32),
   );
 
+  const signal = AbortSignal.any([request.signal, AbortSignal.timeout(90_000)]);
   try {
     const upstream = await fetch(OPENAI_RESPONSES_URL, {
       method: 'POST',
+      signal,
       headers: {
         Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
@@ -133,28 +142,7 @@ export async function POST(request: Request) {
       }),
     });
     if (!upstream.ok) {
-      const status =
-        upstream.status === 429
-          ? 429
-          : upstream.status === 401 || upstream.status === 403
-            ? 503
-            : 502;
-      const code =
-        upstream.status === 429
-          ? 'rate_limited'
-          : upstream.status === 401 || upstream.status === 403
-            ? 'configuration_error'
-            : 'provider_error';
-      return json(
-        {
-          code,
-          message:
-            status === 429
-              ? 'AI is receiving too many requests. Try again shortly.'
-              : 'The AI layout service is temporarily unavailable.',
-        },
-        status,
-      );
+      return aiErrorResponse(await readAiProviderError(upstream));
     }
     const body = await upstream.json();
     const text = outputText(body);
@@ -171,10 +159,10 @@ export async function POST(request: Request) {
   } catch {
     return json(
       {
-        code: 'provider_error',
-        message: 'The AI layout service could not complete this request.',
+        code: signal.aborted ? 'request_timeout' : 'provider_error',
+        message: signal.aborted ? 'The AI request timed out or was cancelled. Please retry.' : 'The AI layout service could not complete this request.',
       },
-      502,
+      signal.aborted ? 504 : 502,
     );
   }
 }

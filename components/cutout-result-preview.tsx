@@ -2,6 +2,7 @@
 
 import * as React from 'react';
 import {
+  cutPixelBounds,
   cutRegionSvgPath,
   type CutRegion,
   type CutShape,
@@ -490,10 +491,11 @@ export function CutoutResultPreview({
             const detail = metadata?.[region.id];
             const label = detail?.label?.trim();
             const confidence = clampedConfidence(detail?.confidence);
-            const left = region.bounds.x * sourceSize.width;
-            const top = region.bounds.y * sourceSize.height;
-            const width = Math.max(region.bounds.w * sourceSize.width, 0.001);
-            const height = Math.max(region.bounds.h * sourceSize.height, 0.001);
+            // Match the exact pixel edges used by cropAsset, including odd
+            // source dimensions and cuts that land between source pixels.
+            const { x: left, y: top, width, height } = cutPixelBounds(
+              region.bounds, sourceSize.width, sourceSize.height,
+            );
             const localPath = cutRegionSvgPath(region, width, height);
             const clipId = `crp-${clipNamespace}-${index}`;
 

@@ -94,6 +94,13 @@ test('snapshot cloning is deep for every mutable editor collection', () => {
   assert.equal(cloned.printRotationOverrides['photo-a'], -90);
 });
 
+test('history preserves the active composition alongside geometry', () => {
+  const state = { ...snapshot(), layout: 'salon' as const };
+  const history = pushHistorySnapshot([], state);
+  assert.equal(history[0].layout, 'salon');
+  assert.equal(editorSnapshotsEqual(state, { ...state, layout: 'custom' }), false);
+});
+
 test('snapshot cloning owns nested borders and editable text styles', () => {
   const original = snapshot();
   original.printGroups = [{ id: 'group-a', code: 'G001', memberIds: ['photo-a', 'text-a'] }];

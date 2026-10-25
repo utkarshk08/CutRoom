@@ -196,10 +196,11 @@ export function CutoutCanvas({
       return;
     }
     const fit = () => {
-      const availableWidth = Math.max(120, parent.clientWidth - 48);
-      const availableHeight = Math.max(160, parent.clientHeight - 82);
+      const style = getComputedStyle(parent);
+      const availableWidth = Math.max(1, parent.clientWidth - parseFloat(style.paddingLeft) - parseFloat(style.paddingRight));
+      const availableHeight = Math.max(1, parent.clientHeight - parseFloat(style.paddingTop) - parseFloat(style.paddingBottom));
       setFitWidth(
-        Math.max(120, Math.min(availableWidth, availableHeight * validAspect)),
+        Math.min(availableWidth, availableHeight * validAspect),
       );
     };
     fit();
@@ -469,6 +470,7 @@ export function CutoutCanvas({
         position: 'relative',
         display: 'block',
         width: fitWidth ? `${fitWidth}px` : '100%',
+        height: fitWidth && validAspect ? `${fitWidth / validAspect}px` : undefined,
         aspectRatio: validAspect,
         touchAction: 'none',
         userSelect: 'none',

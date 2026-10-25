@@ -24,7 +24,9 @@ function Slider({
       value={value}
       min={min}
       max={max}
-      thumbAlignment="edge"
+      // Percentage-based positioning also works when a mobile panel mounts hidden.
+      // Edge alignment needs measurements and can leave its thumb hidden at zero width.
+      thumbAlignment="center"
       {...props}
     >
       <SliderPrimitive.Control className="data-vertical:min-h-40 relative flex w-full touch-none items-center select-none data-disabled:opacity-50 data-vertical:h-full data-vertical:w-auto data-vertical:flex-col">
@@ -41,6 +43,10 @@ function Slider({
           <SliderPrimitive.Thumb
             data-slot="slider-thumb"
             key={index}
+            aria-label={props['aria-label']}
+            aria-labelledby={props['aria-labelledby']}
+            aria-describedby={props['aria-describedby']}
+            aria-valuetext={props['aria-valuetext']}
             className="border-ring ring-ring/50 relative size-3 rounded-full border bg-white transition-[color,box-shadow] after:absolute after:-inset-2 hover:ring-3 focus-visible:ring-3 focus-visible:outline-hidden active:ring-3 block shrink-0 select-none disabled:pointer-events-none disabled:opacity-50"
           />
         ))}

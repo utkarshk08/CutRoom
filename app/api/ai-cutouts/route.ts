@@ -8,6 +8,10 @@ import {
   parseAiCutoutDecision,
   sanitizeAiCutoutRequest,
 } from '@/lib/ai-cutouts';
+import { AiRequestError, aiErrorResponse, readAiJson } from '@/lib/ai-request';
+import { readAiProviderError } from '@/lib/ai-provider-error';
+import { env } from 'cloudflare:workers';
+import { guardAiRequest, type AiAccessEnv } from '@/lib/ai-access';
 
 const OPENAI_RESPONSES_URL = 'https://api.openai.com/v1/responses';
 
@@ -41,6 +45,8 @@ function outputText(value: unknown) {
 }
 
 export async function POST(request: Request) {
+  const rejection = await guardAiRequest(request, env as AiAccessEnv, import.meta.env.DEV);
+  if (rejection) return rejection;
   if (
     !request.headers
       .get('content-type')
@@ -71,8 +77,9 @@ export async function POST(request: Request) {
 
   let input;
   try {
-    input = sanitizeAiCutoutRequest(await request.json());
+    input = sanitizeAiCutoutRequest(await readAiJson(request, MAX_AI_CUTOUT_REQUEST_BYTES));
   } catch (error) {
+    if (error instanceof AiRequestError) return aiErrorResponse(error);
     if (error instanceof AiCutoutRequestError) {
       return json({ code: error.code, message: error.message }, error.status);
     }
@@ -97,9 +104,11 @@ export async function POST(request: Request) {
     );
   }
 
+  const signal = AbortSignal.any([request.signal, AbortSignal.timeout(90_000)]);
   try {
     const upstream = await fetch(OPENAI_RESPONSES_URL, {
       method: 'POST',
+      signal,
       headers: {
         Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
@@ -155,30 +164,7 @@ export async function POST(request: Request) {
     });
 
     if (!upstream.ok) {
-      const status =
-        upstream.status === 429
-          ? 429
-          : upstream.status === 401 || upstream.status === 403
-            ? 503
-            : 502;
-      const code =
-        upstream.status === 429
-          ? 'rate_limited'
-          : upstream.status === 401 || upstream.status === 403
-            ? 'configuration_error'
-            : 'provider_error';
-      return json(
-        {
-          code,
-          message:
-            status === 429
-              ? 'AI cutout detection is receiving too many requests. Try again shortly.'
-              : status === 503
-                ? 'The secure AI cutout connection is not configured correctly.'
-                : 'The AI cutout service is temporarily unavailable.',
-        },
-        status,
-      );
+      return aiErrorResponse(await readAiProviderError(upstream));
     }
 
     const body = await upstream.json();
@@ -207,10 +193,10 @@ export async function POST(request: Request) {
   } catch {
     return json(
       {
-        code: 'provider_error',
-        message: 'The AI cutout service could not complete this request.',
+        code: signal.aborted ? 'request_timeout' : 'provider_error',
+        message: signal.aborted ? 'The AI request timed out or was cancelled. Please retry.' : 'The AI cutout service could not complete this request.',
       },
-      502,
+      signal.aborted ? 504 : 502,
     );
   }
 }

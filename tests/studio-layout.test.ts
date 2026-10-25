@@ -7,6 +7,7 @@ import {
   applyCustomLayout,
   applyLayout,
   buildLayoutUnits,
+  piecesOverlap,
   type LayoutName,
   type Piece,
   type PrintGroup,
@@ -297,4 +298,74 @@ test('custom layouts leave ungrouped text fixed and ignore targets for tray piec
   assert.notDeepEqual(result[0], photo);
   assert.deepEqual(result[1], text);
   assert.deepEqual(result[2], tray);
+});
+
+test('crowded but feasible wall stays collision-free in every composition and custom layout', () => {
+  const squareWall = { ...wall, widthCm: 100, heightCm: 100 };
+  const originals = [0, 51].map((x, index) => ({
+    ...piece(`wide-${index}`, true),
+    x, y: 0, w: 49, h: 90, widthCm: 49, heightCm: 90, rotation: 0,
+  }));
+  assert.equal(piecesOverlap(originals[0], originals[1], squareWall), false);
+  const before = structuredClone(originals);
+  const results = layouts.map((layout) => applyLayout(originals, layout, squareWall, 58));
+  results.push(applyCustomLayout(originals, originals.map(({ id }) => ({
+    unitId: id, centerXPercent: 50, centerYPercent: 50,
+  })), squareWall, 58));
+  for (const result of results) {
+    assert.equal(piecesOverlap(result[0], result[1], squareWall), false);
+    result.forEach((item, index) => {
+      assertOnlyTranslated(originals[index], item);
+      assert.ok(item.x >= 0 && item.y >= 0 && item.x + item.w <= 100 && item.y + item.h <= 100);
+    });
+  }
+  assert.deepEqual(originals, before, 'search attempts never mutate the input');
+});
+
+test('tight grouped photo and text stay rigid without colliding with another large item', () => {
+  const squareWall = { ...wall, widthCm: 100, heightCm: 100 };
+  const photo = { ...piece('large-photo', true), x: 0, y: 0, w: 49, h: 90, widthCm: 49, heightCm: 90, rotation: 0 };
+  const caption: Piece = { ...piece('caption', true), kind: 'text', x: 5, y: 10, w: 20, h: 10, widthCm: 20, heightCm: 10, rotation: 0, text: createTextData('bold-headline', 'Together') };
+  const other = { ...photo, id: 'other', code: 'OTHER', x: 51 };
+  const group = { id: 'group', code: 'G001', memberIds: [photo.id, caption.id] };
+  const originals = [photo, caption, other];
+  const result = applyLayout(originals, 'salon', squareWall, 58, 50, [group]);
+  assert.equal(piecesOverlap(result[0], result[2], squareWall), false);
+  assertClose(result[1].x - result[0].x, caption.x - photo.x);
+  assertClose(result[1].y - result[0].y, caption.y - photo.y);
+  result.forEach((item, index) => assertOnlyTranslated(originals[index], item));
+});
+
+test('invalid custom targets fail without changing the wall', () => {
+  const originals = [piece('invalid-target', true)];
+  const before = structuredClone(originals);
+  assert.throws(() => applyCustomLayout(originals, [{ unitId: originals[0].id, centerXPercent: Number.NaN, centerYPercent: 50 }], wall), /arrangement/i);
+  assert.deepEqual(originals, before);
+});
+
+test('overlapping envelopes of separate angled photos do not exempt new actual collisions', () => {
+  const squareWall = { ...wall, widthCm: 100, heightCm: 100 };
+  const originals = [
+    [41.18, 12.62, 43.65, 22.13], [34.71, 11.21, 33.29, 65.1],
+    [32.03, 16.96, 13.21, 34.09], [44.39, 8.12, 7.06, 61.69],
+    [33.75, 12.61, 59.53, 54.02],
+  ].map(([w, h, x, y], index) => ({
+    ...piece(`${[1, 2, 3, 5, 6][index]}`, true), w, h, x, y, widthCm: w, heightCm: h, rotation: 45,
+  }));
+  const before = structuredClone(originals);
+  const assertClear = (items: Piece[]) => items.forEach((a, i) => items.slice(i + 1).forEach((b) => {
+    assert.equal(piecesOverlap(a, b, squareWall), false, `${a.id} and ${b.id} must remain separate`);
+  }));
+  assertClear(originals);
+  for (const layout of layouts) {
+    try {
+      const result = applyLayout(originals, layout, squareWall, 58);
+      assertClear(result);
+      result.forEach((item, index) => assertOnlyTranslated(originals[index], item));
+    } catch (error) {
+      // A dense proposal may be rejected, but must never commit a collision.
+      assert.match((error as Error).message, /^This arrangement would add overlaps/);
+    }
+    assert.deepEqual(originals, before);
+  }
 });
